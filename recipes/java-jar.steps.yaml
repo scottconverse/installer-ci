@@ -1,0 +1,494 @@
+- name: Checkout
+  if: matrix.type == 'java-jar'
+  uses: actions/checkout@v4
+
+- name: Set up JDK 17 (includes jpackage)
+  if: matrix.type == 'java-jar'
+  uses: actions/setup-java@v4
+  with:
+    distribution: temurin
+    java-version: '17'
+    cache: maven
+
+# WiX is required by jpackage to emit .msi/.exe on Windows.
+- name: Install WiX Toolset (Windows, required by jpackage MSI)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    choco install wixtoolset --no-progress -y
+    echo "${env:WIX}bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+# ---------------------------------------------------------------------------
+# G2: BUILD the runnable JAR, then BUILD the native installer artifact.
+# Never assume target/ or dist/ pre-exists. We detect Maven vs Gradle.
+# ---------------------------------------------------------------------------
+- name: Build runnable JAR (POSIX)
+  if: matrix.type == 'java-jar' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Product/package names are derived from a documented var with a sane
+    # default; no hardcoded product name leaks into install/launch/uninstall.
+    APP_NAME="${PRODUCT_NAME:-${{ vars.PRODUCT_NAME || 'InstallerTestApp' }}}"
+    LINUX_PKG="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9.+-')"
+    echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+    echo "LINUX_PKG=$LINUX_PKG" >> "$GITHUB_ENV"
+    if [ -f mvnw ]; then
+      ./mvnw -B -ntp package -DskipTests
+    elif [ -f pom.xml ]; then
+      mvn -B -ntp package -DskipTests
+    elif [ -f gradlew ]; then
+      ./gradlew --no-daemon clean build -x test
+    elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+      gradle --no-daemon clean build -x test
+    else
+      echo "::error::No Maven/Gradle build descriptor found for java-jar type."
+      exit 1
+    fi
+    # Locate the produced runnable/fat JAR (skip sources/javadoc/original-* jars).
+    JAR="$(find target build/libs -type f -name '*.jar' 2>/dev/null \
+            | grep -Ev 'sources|javadoc|original-' | sort | tail -n1 || true)"
+    if [ -z "${JAR:-}" ] || [ ! -f "$JAR" ]; then
+      echo "::error::Build completed but no runnable JAR was found."
+      exit 1
+    fi
+    echo "Found JAR: $JAR"
+    # Stage exactly one jar into a clean input dir for jpackage.
+    rm -rf jp-input && mkdir -p jp-input
+    cp "$JAR" "jp-input/app.jar"
+    # Verify the JAR declares a Main-Class (required for a runnable installer).
+    if ! unzip -p "$JAR" META-INF/MANIFEST.MF | tr -d '\r' | grep -q '^Main-Class:'; then
+      echo "::error::JAR has no Main-Class in MANIFEST.MF; cannot build a launchable installer."
+      exit 1
+    fi
+    MAIN_CLASS="$(unzip -p "$JAR" META-INF/MANIFEST.MF | tr -d '\r' \
+                   | awk -F': ' '/^Main-Class:/{print $2}')"
+    echo "APP_MAIN_CLASS=$MAIN_CLASS" >> "$GITHUB_ENV"
+
+- name: Build runnable JAR (Windows)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # Product name derived from a documented var with a sane default.
+    $appName = if ($env:PRODUCT_NAME) { $env:PRODUCT_NAME } elseif ("${{ vars.PRODUCT_NAME }}") { "${{ vars.PRODUCT_NAME }}" } else { "InstallerTestApp" }
+    "APP_NAME=$appName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    if (Test-Path mvnw.cmd)      { .\mvnw.cmd -B -ntp package -DskipTests }
+    elseif (Test-Path pom.xml)   { mvn -B -ntp package -DskipTests }
+    elseif (Test-Path gradlew.bat) { .\gradlew.bat --no-daemon clean build -x test }
+    elseif ((Test-Path build.gradle) -or (Test-Path build.gradle.kts)) { gradle --no-daemon clean build -x test }
+    else { Write-Error "No Maven/Gradle build descriptor found for java-jar type."; exit 1 }
+    if ($LASTEXITCODE -ne 0) { Write-Error "Build failed."; exit 1 }
+    $jar = Get-ChildItem -Recurse -Path target,build/libs -Filter *.jar -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -notmatch 'sources|javadoc|original-' } |
+           Sort-Object FullName | Select-Object -Last 1
+    if (-not $jar) { Write-Error "Build completed but no runnable JAR was found."; exit 1 }
+    Write-Host "Found JAR: $($jar.FullName)"
+    if (Test-Path jp-input) { Remove-Item -Recurse -Force jp-input }
+    New-Item -ItemType Directory -Path jp-input | Out-Null
+    Copy-Item $jar.FullName jp-input/app.jar
+    $manifest = (jar xf $jar.FullName META-INF/MANIFEST.MF) 2>$null
+    $mfText = Get-Content META-INF/MANIFEST.MF -Raw
+    $mainLine = ($mfText -split "`r?`n" | Where-Object { $_ -match '^Main-Class:' })
+    if (-not $mainLine) { Write-Error "JAR has no Main-Class in MANIFEST.MF; cannot build a launchable installer."; exit 1 }
+    $mainClass = ($mainLine -replace '^Main-Class:\s*','').Trim()
+    "APP_MAIN_CLASS=$mainClass" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+# ---------------------------------------------------------------------------
+# Build the NATIVE INSTALLER with jpackage. One step per OS (G4: idiomatic).
+# ---------------------------------------------------------------------------
+- name: jpackage installer (Linux .deb)
+  if: matrix.type == 'java-jar' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    mkdir -p dist
+    jpackage \
+      --type deb \
+      --name "${APP_NAME}" \
+      --app-version 1.0.0 \
+      --input jp-input \
+      --main-jar app.jar \
+      --main-class "${APP_MAIN_CLASS}" \
+      --dest dist \
+      --linux-package-name "${LINUX_PKG}" \
+      --linux-shortcut
+    DEB="$(find dist -maxdepth 1 -name '*.deb' | head -n1)"
+    if [ -z "${DEB:-}" ] || [ ! -f "$DEB" ]; then
+      echo "::error::jpackage did not produce a .deb artifact."; exit 1
+    fi
+    echo "Built installer: $DEB ($(du -h "$DEB" | cut -f1))"
+    echo "INSTALLER_PATH=$DEB" >> "$GITHUB_ENV"
+
+- name: jpackage installer (macOS .dmg)
+  if: matrix.type == 'java-jar' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    mkdir -p dist
+    jpackage \
+      --type dmg \
+      --name "${APP_NAME}" \
+      --app-version 1.0.0 \
+      --input jp-input \
+      --main-jar app.jar \
+      --main-class "${APP_MAIN_CLASS}" \
+      --dest dist
+    DMG="$(find dist -maxdepth 1 -name '*.dmg' | head -n1)"
+    if [ -z "${DMG:-}" ] || [ ! -f "$DMG" ]; then
+      echo "::error::jpackage did not produce a .dmg artifact."; exit 1
+    fi
+    echo "Built installer: $DMG ($(du -h "$DMG" | cut -f1))"
+    echo "INSTALLER_PATH=$DMG" >> "$GITHUB_ENV"
+
+- name: jpackage installer (Windows .msi)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    New-Item -ItemType Directory -Force -Path dist | Out-Null
+    & jpackage `
+      --type msi `
+      --name "$env:APP_NAME" `
+      --app-version 1.0.0 `
+      --input jp-input `
+      --main-jar app.jar `
+      --main-class "$env:APP_MAIN_CLASS" `
+      --dest dist `
+      --win-per-user-install `
+      --win-menu `
+      --win-dir-chooser
+    if ($LASTEXITCODE -ne 0) { Write-Error "jpackage failed to build the .msi."; exit 1 }
+    $msi = Get-ChildItem dist -Filter *.msi | Select-Object -First 1
+    if (-not $msi) { Write-Error "jpackage did not produce a .msi artifact."; exit 1 }
+    Write-Host "Built installer: $($msi.FullName) ($([math]::Round($msi.Length/1MB,1)) MB)"
+    "INSTALLER_PATH=$($msi.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+# ---------------------------------------------------------------------------
+# G8: SIGNING/NOTARIZATION structural check (WARN, never hard-fail on public CI).
+# ---------------------------------------------------------------------------
+- name: Signature / notarization check (macOS, WARN only)
+  if: matrix.type == 'java-jar' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -uo pipefail
+    echo "::group::Gatekeeper / codesign status (informational)"
+    if spctl -a -vvv -t open --context context:primary-signature "${INSTALLER_PATH}" 2>&1; then
+      echo "spctl: assessment passed."
+    else
+      echo "::warning::DMG not notarized/accepted by Gatekeeper (expected on public CI without signing secrets)."
+    fi
+    if codesign -dv --verbose=4 "${INSTALLER_PATH}" 2>&1; then
+      echo "codesign: signature present."
+    else
+      echo "::warning::DMG is unsigned (expected without APPLE_DEVELOPER_ID secrets)."
+    fi
+    echo "::endgroup::"
+
+- name: Signature check (Windows Authenticode, WARN only)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Continue'
+    $sig = Get-AuthenticodeSignature "$env:INSTALLER_PATH"
+    Write-Host "Authenticode status: $($sig.Status)"
+    if ($sig.Status -ne 'Valid') {
+      Write-Warning "MSI is not Authenticode-signed (expected on public CI without a code-signing cert). SmartScreen would warn end users."
+    } else {
+      Write-Host "MSI is validly signed by: $($sig.SignerCertificate.Subject)"
+    }
+
+# ---------------------------------------------------------------------------
+# G6 (prep): UPGRADE — install a REAL previous release FIRST to create dirty
+# state. Graceful skip if no prior release / no matching asset exists.
+# ---------------------------------------------------------------------------
+- name: Install previous release for upgrade test (Linux)
+  if: matrix.type == 'java-jar' && runner.os == 'Linux'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -euo pipefail
+    TAG="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+    if [ -z "${TAG:-}" ]; then
+      echo "PREV_INSTALLED=false" >> "$GITHUB_ENV"
+      echo "::notice::SKIPPED upgrade dirty-state: no prior release exists; upgrade will run as clean install."
+      exit 0
+    fi
+    echo "Downloading previous release $TAG"
+    # Distinguish "no matching asset" (legit skip) from a real API/download error
+    # (must FAIL). Capture the asset list first so a gh API failure hard-fails
+    # here instead of being swallowed by the asset-presence test below.
+    ASSETS="$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name')"
+    if echo "$ASSETS" | grep -q '\.deb$'; then
+      # A .deb asset exists -> any download failure is a HARD error, never a skip.
+      gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*.deb' --dir prev
+    else
+      echo "PREV_INSTALLED=false" >> "$GITHUB_ENV"
+      echo "::notice::SKIPPED upgrade dirty-state: release $TAG has no .deb asset."
+      exit 0
+    fi
+    PREV_DEB="$(find prev -name '*.deb' | head -n1)"
+    if [ -z "${PREV_DEB:-}" ] || [ ! -f "$PREV_DEB" ]; then
+      echo "::error::Prior .deb download reported success but no file is present."; exit 1
+    fi
+    sudo apt-get update
+    sudo apt-get install -y "./$PREV_DEB"
+    echo "PREV_INSTALLED=true" >> "$GITHUB_ENV"
+    echo "Previous version installed; binary present: $(ls -l "/opt/${LINUX_PKG}/bin/" || true)"
+
+- name: Install previous release for upgrade test (macOS)
+  if: matrix.type == 'java-jar' && runner.os == 'macOS'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -euo pipefail
+    TAG="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')"
+    if [ -z "${TAG:-}" ]; then
+      echo "PREV_INSTALLED=false" >> "$GITHUB_ENV"
+      echo "::notice::SKIPPED upgrade dirty-state: no prior release exists; upgrade will run as clean install."
+      exit 0
+    fi
+    # Distinguish "no matching asset" (legit skip) from an API/download error
+    # (FAIL). Capture asset list first so a gh API failure is not swallowed.
+    ASSETS="$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets --jq '.assets[].name')"
+    if echo "$ASSETS" | grep -q '\.dmg$'; then
+      gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*.dmg' --dir prev
+    else
+      echo "PREV_INSTALLED=false" >> "$GITHUB_ENV"
+      echo "::notice::SKIPPED upgrade dirty-state: release $TAG has no .dmg asset."
+      exit 0
+    fi
+    PREV_DMG="$(find prev -name '*.dmg' | head -n1)"
+    if [ -z "${PREV_DMG:-}" ] || [ ! -f "$PREV_DMG" ]; then
+      echo "::error::Prior .dmg download reported success but no file is present."; exit 1
+    fi
+    MNT="$(hdiutil attach "$PREV_DMG" -nobrowse -readonly | awk '/Volumes/{print $3; exit}')"
+    sudo cp -R "$MNT/${APP_NAME}.app" /Applications/
+    hdiutil detach "$MNT" || true
+    # Strip Gatekeeper quarantine so an unsigned prior release does not hard-fail
+    # if launched before the upgrade overwrites it (G8 stays warn-only).
+    sudo xattr -dr com.apple.quarantine "/Applications/${APP_NAME}.app" || true
+    echo "PREV_INSTALLED=true" >> "$GITHUB_ENV"
+    test -d "/Applications/${APP_NAME}.app" || { echo "::error::Previous .app not staged."; exit 1; }
+
+- name: Install previous release for upgrade test (Windows)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $tag = (gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+    if (-not $tag) {
+      "PREV_INSTALLED=false" | Out-File $env:GITHUB_ENV -Append
+      Write-Host "::notice::SKIPPED upgrade dirty-state: no prior release exists; upgrade will run as clean install."
+      exit 0
+    }
+    # Distinguish "no .msi asset" (legit skip) from a real download error (FAIL).
+    $assets = (gh release view $tag --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+    if (-not ($assets | Select-String -Pattern '\.msi$' -Quiet)) {
+      "PREV_INSTALLED=false" | Out-File $env:GITHUB_ENV -Append
+      Write-Host "::notice::SKIPPED upgrade dirty-state: release $tag has no .msi asset."
+      exit 0
+    }
+    gh release download $tag --repo "${{ github.repository }}" --pattern '*.msi' --dir prev
+    if ($LASTEXITCODE -ne 0) { Write-Error "Prior .msi download failed (exit $LASTEXITCODE)."; exit 1 }
+    $prev = Get-ChildItem prev -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $prev) { Write-Error "Prior .msi download reported success but no file is present."; exit 1 }
+    $p = Start-Process msiexec -ArgumentList "/i `"$($prev.FullName)`" /qn /norestart" -Wait -PassThru
+    if ($p.ExitCode -ne 0) { Write-Error "Previous MSI install failed (exit $($p.ExitCode))."; exit 1 }
+    "PREV_INSTALLED=true" | Out-File $env:GITHUB_ENV -Append
+
+# ---------------------------------------------------------------------------
+# INSTALL the freshly built installer. On a clean machine this is install;
+# when PREV_INSTALLED=true it is a genuine UPGRADE over dirty state (G6).
+# G1: exit codes asserted on every installer invocation.
+# ---------------------------------------------------------------------------
+- name: Install / upgrade (Linux .deb, system scope)
+  if: matrix.type == 'java-jar' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get update
+    sudo apt-get install -y "${INSTALLER_PATH}"   # dpkg upgrade-in-place if prev present
+    test -x "/opt/${LINUX_PKG}/bin/${APP_NAME}" \
+      || { echo "::error::Installed launcher missing after install."; exit 1; }
+    echo "Install OK. Upgrade-over-prev: ${PREV_INSTALLED:-false}"
+
+- name: Install / upgrade (macOS .dmg, user/Applications scope)
+  if: matrix.type == 'java-jar' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    MNT="$(hdiutil attach "${INSTALLER_PATH}" -nobrowse | awk '/Volumes/{print $3; exit}')"
+    # Real upgrade semantics: replace any prior .app in place.
+    sudo rm -rf "/Applications/${APP_NAME}.app"
+    sudo cp -R "$MNT/${APP_NAME}.app" /Applications/
+    hdiutil detach "$MNT" || true
+    test -d "/Applications/${APP_NAME}.app" \
+      || { echo "::error::.app not present in /Applications after install."; exit 1; }
+    echo "Install OK. Upgrade-over-prev: ${PREV_INSTALLED:-false}"
+
+- name: Install / upgrade (Windows .msi, per-user scope)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $log = "$env:RUNNER_TEMP\install.log"
+    $p = Start-Process msiexec -ArgumentList "/i `"$env:INSTALLER_PATH`" /qn /norestart /l*v `"$log`"" -Wait -PassThru
+    if ($p.ExitCode -ne 0) {
+      Write-Host "----- MSI log tail -----"; Get-Content $log -Tail 40
+      Write-Error "MSI install/upgrade failed (exit $($p.ExitCode))."; exit 1
+    }
+    $exe = Get-ChildItem "$env:LOCALAPPDATA\$env:APP_NAME","$env:ProgramFiles\$env:APP_NAME" -Recurse -Filter "$($env:APP_NAME).exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $exe) { Write-Error "Installed $($env:APP_NAME).exe not found after install."; exit 1 }
+    "APP_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append
+    Write-Host "Install OK at $($exe.FullName). Upgrade-over-prev: $env:PREV_INSTALLED"
+
+# ---------------------------------------------------------------------------
+# G5: REAL LAUNCH of the installed app. jpackage apps are launchable native
+# binaries; we start the process headless and assert it actually runs.
+# (Console apps exit 0; GUI apps are launched under a display and probed alive.)
+# ---------------------------------------------------------------------------
+- name: Launch / smoke-verify (Linux, headless via xvfb)
+  if: matrix.type == 'java-jar' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get install -y xvfb
+    BIN="/opt/${LINUX_PKG}/bin/${APP_NAME}"
+    test -x "$BIN" || { echo "::error::Installed launcher $BIN missing/not executable."; exit 1; }
+    set +e
+    # Launch under a virtual display. Do NOT trust the xvfb-run wrapper's PID/exit:
+    # a 124 timeout only means *something* under the wrapper survived. Probe the
+    # REAL app process by its full install path before deciding success.
+    timeout 25s xvfb-run -a "$BIN" >launch.out 2>&1 &
+    WRAPPER_PID=$!
+    # Give the JVM a moment to fork the real launcher under the wrapper.
+    sleep 10
+    if pgrep -f "$BIN" >/dev/null; then
+      # GUI app: the real installed binary is alive (verified by full path).
+      echo "Launch verified: installed app process alive ($BIN)."
+      pkill -f "$BIN" || true
+      kill "$WRAPPER_PID" 2>/dev/null || true
+      wait "$WRAPPER_PID" 2>/dev/null || true
+    else
+      # Not alive: either a console app that exited cleanly, or a real crash.
+      wait "$WRAPPER_PID"
+      rc=$?
+      cat launch.out || true
+      if [ "$rc" -eq 0 ]; then
+        echo "Launch verified: console app ran and exited cleanly (0)."
+      else
+        echo "::error::Installed app failed to launch (no live process; exit=$rc)."; exit 1
+      fi
+    fi
+
+- name: Launch / smoke-verify (macOS)
+  if: matrix.type == 'java-jar' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    BIN="/Applications/${APP_NAME}.app/Contents/MacOS/${APP_NAME}"
+    test -x "$BIN" || { echo "::error::Installed launcher $BIN missing/not executable."; exit 1; }
+    open -g "/Applications/${APP_NAME}.app"
+    sleep 8
+    # Match the FULL absolute launcher path so we cannot false-pass on an
+    # unrelated process that merely shares a basename substring.
+    if pgrep -f "$BIN" >/dev/null; then
+      echo "Launch verified: process is alive ($BIN)."
+      pkill -f "$BIN" || true
+    else
+      # Console-style jpackage app may have already exited cleanly; verify the
+      # launcher binary at least executes without crashing.
+      "$BIN" & APP_PID=$!
+      sleep 5
+      if kill -0 "$APP_PID" 2>/dev/null; then echo "Launch verified (alive)."; kill "$APP_PID" || true;
+      else
+        wait "$APP_PID"; rc=$?
+        if [ "$rc" -eq 0 ]; then echo "Launch verified: console app exited cleanly (0).";
+        else echo "::error::Installed app did not stay alive and no clean run detected (exit=$rc)."; exit 1; fi
+      fi
+    fi
+
+- name: Launch / smoke-verify (Windows)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $proc = Start-Process -FilePath "$env:APP_EXE" -PassThru
+    Start-Sleep -Seconds 8
+    $live = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+    if ($live) {
+      Write-Host "Launch verified: process alive (PID $($proc.Id))."
+      Stop-Process -Id $proc.Id -Force
+    }
+    elseif ($proc.HasExited -and $proc.ExitCode -eq 0) {
+      Write-Host "Launch verified: console app exited cleanly (0)."
+    }
+    else {
+      Write-Error "Installed app failed to launch (exit $($proc.ExitCode))."; exit 1
+    }
+
+# ---------------------------------------------------------------------------
+# G7: UNINSTALL, then NEGATIVE-ASSERT full removal (fail if anything remains).
+# ---------------------------------------------------------------------------
+- name: Uninstall + verify removal (Linux)
+  if: matrix.type == 'java-jar' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get remove -y "${LINUX_PKG}"
+    sudo apt-get purge -y "${LINUX_PKG}" || true
+    if [ -e "/opt/${LINUX_PKG}/bin/${APP_NAME}" ] || [ -d "/opt/${LINUX_PKG}" ]; then
+      echo "::error::Files remain under /opt/${LINUX_PKG} after uninstall."; exit 1
+    fi
+    if dpkg -s "${LINUX_PKG}" >/dev/null 2>&1; then
+      echo "::error::Package still registered with dpkg after uninstall."; exit 1
+    fi
+    echo "Uninstall verified: package and files fully removed."
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify removal (macOS)
+  if: matrix.type == 'java-jar' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo rm -rf "/Applications/${APP_NAME}.app"
+    if [ -d "/Applications/${APP_NAME}.app" ]; then
+      echo "::error::.app still present after uninstall."; exit 1
+    fi
+    echo "Uninstall verified: /Applications/${APP_NAME}.app removed."
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify removal (Windows)
+  if: matrix.type == 'java-jar' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $log = "$env:RUNNER_TEMP\uninstall.log"
+    # Resolve ProductCode from the freshly built MSI for a reliable silent uninstall.
+    $p = Start-Process msiexec -ArgumentList "/x `"$env:INSTALLER_PATH`" /qn /norestart /l*v `"$log`"" -Wait -PassThru
+    if ($p.ExitCode -ne 0) {
+      Write-Host "----- uninstall log tail -----"; Get-Content $log -Tail 40
+      Write-Error "MSI uninstall failed (exit $($p.ExitCode))."; exit 1
+    }
+    if (Test-Path "$env:APP_EXE") {
+      Write-Error "$($env:APP_NAME).exe still present after uninstall: $env:APP_EXE"; exit 1
+    }
+    $still = Get-ChildItem "$env:LOCALAPPDATA\$env:APP_NAME","$env:ProgramFiles\$env:APP_NAME" -ErrorAction SilentlyContinue
+    if ($still) { Write-Error "Install directory still present after uninstall."; exit 1 }
+    Write-Host "Uninstall verified: executable and install dir removed."
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+# Upload the built installer so other jobs / future upgrade tests can consume it.
+- name: Upload installer artifact
+  if: matrix.type == 'java-jar'
+  uses: actions/upload-artifact@v4
+  with:
+    name: java-jar-installer-${{ runner.os }}
+    path: dist/*
+    if-no-files-found: error

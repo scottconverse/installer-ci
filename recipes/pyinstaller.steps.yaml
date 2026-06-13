@@ -1,0 +1,497 @@
+- name: Checkout (pyinstaller)
+  if: matrix.type == 'pyinstaller'
+  uses: actions/checkout@v4
+
+- name: Set up Python (pyinstaller)
+  if: matrix.type == 'pyinstaller'
+  uses: actions/setup-python@v5
+  with:
+    python-version: '3.12'
+
+# ---------------------------------------------------------------------------
+# G4: OS-specific build deps in their own idiomatic-shell steps.
+# Linux needs Tk dev headers (CustomTkinter -> tkinter) at build time and
+# X11/xcb runtime libs + xvfb for the headless GUI launch later (G5).
+# ---------------------------------------------------------------------------
+- name: Install Linux build/runtime deps (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends \
+      python3-tk tk-dev \
+      xvfb \
+      libx11-6 libxext6 libxrender1 libxtst6 libxi6 \
+      libxcb1 libxkbcommon0 libgl1 libglib2.0-0
+
+- name: Install Python deps + PyInstaller (pyinstaller)
+  if: matrix.type == 'pyinstaller'
+  shell: bash
+  run: |
+    set -euo pipefail
+    python -m pip install --upgrade pip
+    if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
+    python -m pip install pyinstaller
+
+# ---------------------------------------------------------------------------
+# G2 + G4: BUILD the artifact in-job. Never assume dist/ exists.
+# Prefer the repo's own *.spec; otherwise reproduce the documented onedir
+# --windowed invocation. Each OS step is idiomatic to its single shell.
+# We capture a canonical APP_NAME for downstream steps.
+# ---------------------------------------------------------------------------
+- name: Build PyInstaller artifact - Unix (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os != 'Windows'
+  shell: bash
+  env:
+    APP_NAME: CivicTransparencyToolkit
+    ENTRY: main.py
+  run: |
+    set -euo pipefail
+    rm -rf build dist
+    SEP=":"
+    EXTRA_DATA=()
+    [ -d prompts ]   && EXTRA_DATA+=(--add-data "prompts${SEP}prompts")
+    [ -d templates ] && EXTRA_DATA+=(--add-data "templates${SEP}templates")
+    ICON=()
+    if [ -f assets/icon.icns ]; then ICON=(--icon assets/icon.icns)
+    elif [ -f assets/icon.png ]; then ICON=(--icon assets/icon.png); fi
+    SPEC="$(ls *.spec 2>/dev/null | head -n1 || true)"
+    if [ -n "$SPEC" ]; then
+      echo "Building from spec: $SPEC"
+      python -m PyInstaller --noconfirm --clean "$SPEC"
+    else
+      echo "No .spec found; building from $ENTRY"
+      python -m PyInstaller \
+        --name "$APP_NAME" --onedir --windowed \
+        "${ICON[@]}" "${EXTRA_DATA[@]}" \
+        --hidden-import yt_dlp \
+        --hidden-import youtube_transcript_api \
+        --hidden-import docx \
+        --noconfirm --clean "$ENTRY"
+    fi
+    ls -la dist/
+    echo "APP_NAME=${APP_NAME}" >> "$GITHUB_ENV"
+
+- name: Build PyInstaller artifact - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    APP_NAME: CivicTransparencyToolkit
+    ENTRY: main.py
+  run: |
+    $ErrorActionPreference = 'Stop'
+    if (Test-Path build) { Remove-Item -Recurse -Force build }
+    if (Test-Path dist)  { Remove-Item -Recurse -Force dist }
+    $extra = @()
+    if (Test-Path prompts)   { $extra += @('--add-data', 'prompts;prompts') }
+    if (Test-Path templates) { $extra += @('--add-data', 'templates;templates') }
+    $icon = @()
+    if (Test-Path assets/icon.ico) { $icon = @('--icon', 'assets/icon.ico') }
+    $spec = Get-ChildItem -Filter *.spec -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($spec) {
+      Write-Host "Building from spec: $($spec.Name)"
+      python -m PyInstaller --noconfirm --clean $spec.FullName
+    } else {
+      Write-Host "No .spec found; building from $env:ENTRY"
+      python -m PyInstaller `
+        --name $env:APP_NAME --onedir --windowed `
+        @icon @extra `
+        --hidden-import yt_dlp `
+        --hidden-import youtube_transcript_api `
+        --hidden-import docx `
+        --noconfirm --clean $env:ENTRY
+    }
+    # G1: a crashed PyInstaller turns the job red.
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed with exit code $LASTEXITCODE" }
+    Get-ChildItem dist
+    "APP_NAME=$env:APP_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+# ---------------------------------------------------------------------------
+# G2: VERIFY the artifact actually exists before we try to "install" it.
+# onedir layout: Linux -> dist/<APP>/<APP> ; Windows -> dist/<APP>/<APP>.exe ;
+# macOS --windowed -> dist/<APP>.app (bundle).
+# ---------------------------------------------------------------------------
+- name: Verify build artifact - Linux (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    BIN="dist/${APP_NAME}/${APP_NAME}"
+    if [ ! -x "$BIN" ]; then echo "::error::Expected onedir binary missing: $BIN"; ls -R dist || true; exit 1; fi
+    file "$BIN"
+    echo "Artifact verified: $BIN"
+
+- name: Verify build artifact - macOS (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    APP="dist/${APP_NAME}.app"
+    BIN="$APP/Contents/MacOS/${APP_NAME}"
+    if [ ! -d "$APP" ];  then echo "::error::Expected .app bundle missing: $APP"; ls -R dist || true; exit 1; fi
+    if [ ! -f "$BIN" ];  then echo "::error::Bundle executable missing: $BIN"; exit 1; fi
+    echo "Artifact verified: $APP"
+
+- name: Verify build artifact - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $exe = "dist/$env:APP_NAME/$env:APP_NAME.exe"
+    if (-not (Test-Path $exe)) {
+      Write-Host "::error::Expected onedir exe missing: $exe"
+      Get-ChildItem -Recurse dist | Select-Object FullName
+      exit 1
+    }
+    Write-Host "Artifact verified: $exe"
+
+# ---------------------------------------------------------------------------
+# G8: SIGNING / NOTARIZATION structural check. PyInstaller output is unsigned
+# on public CI (no secrets). WARN, do not hard-fail, so status is visible.
+# ---------------------------------------------------------------------------
+- name: Signing check - macOS Gatekeeper/codesign WARN (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -uo pipefail
+    APP="dist/${APP_NAME}.app"
+    echo "== codesign -dv =="
+    if codesign -dv --verbose=4 "$APP" 2>&1 | tee /tmp/cs.txt; then :; fi
+    echo "== spctl assess (Gatekeeper) =="
+    if spctl --assess --type execute --verbose=4 "$APP" 2>&1 | tee /tmp/spctl.txt; then
+      echo "App is accepted by Gatekeeper."
+    else
+      echo "::warning title=Unsigned/Unnotarized::'${APP}' is not signed/notarized (expected on public CI without Developer ID + notarytool secrets). Users will hit Gatekeeper. codesign/spctl output above."
+    fi
+
+- name: Signing check - Windows Authenticode WARN (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $exe = "dist/$env:APP_NAME/$env:APP_NAME.exe"
+    $sig = Get-AuthenticodeSignature $exe
+    Write-Host "Signature status: $($sig.Status)"
+    if ($sig.Status -ne 'Valid') {
+      Write-Host "::warning title=Unsigned binary::'$exe' has no valid Authenticode signature (Status=$($sig.Status)). Expected on public CI without a code-signing cert; users may see SmartScreen. Not failing the build."
+    } else {
+      Write-Host "Authenticode signature is valid: $($sig.SignerCertificate.Subject)"
+    }
+
+# ---------------------------------------------------------------------------
+# INSTALL (user-scope). PyInstaller has no native OS installer / no
+# system-scope concept of its own: distribution is a zip that the user
+# extracts and runs. We model the real flow: stage the dist payload into a
+# per-user install location (no admin/sudo). This is the only scope that is
+# REAL for this installer type, so we test it and note the absence of a
+# genuine system-scope path rather than faking an MSI/pkg.
+# ---------------------------------------------------------------------------
+- name: Install (user-scope, extract) - Linux (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    INSTALL_DIR="$HOME/.local/opt/${APP_NAME}"
+    rm -rf "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
+    cp -R "dist/${APP_NAME}/." "$INSTALL_DIR/"
+    test -x "$INSTALL_DIR/${APP_NAME}"
+    echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+    echo "INSTALLED_BIN=$INSTALL_DIR/${APP_NAME}" >> "$GITHUB_ENV"
+    echo "Installed to $INSTALL_DIR"
+
+- name: Install (user-scope, extract) - macOS (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    INSTALL_DIR="$HOME/Applications"
+    mkdir -p "$INSTALL_DIR"
+    rm -rf "$INSTALL_DIR/${APP_NAME}.app"
+    cp -R "dist/${APP_NAME}.app" "$INSTALL_DIR/"
+    test -d "$INSTALL_DIR/${APP_NAME}.app"
+    echo "INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+    echo "INSTALLED_APP=$INSTALL_DIR/${APP_NAME}.app" >> "$GITHUB_ENV"
+    echo "Installed to $INSTALL_DIR/${APP_NAME}.app"
+
+- name: Install (user-scope, extract) - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $installDir = Join-Path $env:LOCALAPPDATA "Programs\$env:APP_NAME"
+    if (Test-Path $installDir) { Remove-Item -Recurse -Force $installDir }
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+    Copy-Item -Recurse -Force "dist/$env:APP_NAME/*" $installDir
+    $exe = Join-Path $installDir "$env:APP_NAME.exe"
+    if (-not (Test-Path $exe)) { throw "Install failed: $exe missing" }
+    "INSTALL_DIR=$installDir"  | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+    "INSTALLED_EXE=$exe"       | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Installed to $installDir"
+
+# ---------------------------------------------------------------------------
+# G5: REAL LAUNCH (GUI). This is a CustomTkinter/Tkinter GUI with NO --version
+# flag, so we must actually start it and assert it stays alive. A frozen app
+# that fails on import/Tk-init dies in <1s; surviving N seconds proves the
+# bundle (hidden imports, --add-data, Tcl/Tk) is intact.
+# ---------------------------------------------------------------------------
+- name: Launch smoke test (headless GUI) - Linux (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "Launching under Xvfb: $INSTALLED_BIN"
+    # NOTE: $! here is the xvfb-run WRAPPER pid, not the frozen app. The wrapper
+    # stays alive for the full sleep even if the app dies on import in <1s, so we
+    # must NOT trust it (that is a textbook false pass). Instead, after the grace
+    # period, pgrep the FULL installed binary path to confirm the REAL app process
+    # is alive, then assert on that.
+    xvfb-run -a --server-args="-screen 0 1280x1024x24" "$INSTALLED_BIN" &
+    WRAPPER_PID=$!
+    sleep 8
+    if pgrep -f "$INSTALLED_BIN" >/dev/null 2>&1; then
+      echo "GUI app ($INSTALLED_BIN) is alive after 8s — launch OK."
+      pkill -f "$INSTALLED_BIN" 2>/dev/null || true
+      kill "$WRAPPER_PID" 2>/dev/null || true
+      wait "$WRAPPER_PID" 2>/dev/null || true
+    else
+      echo "::error::GUI app process not found after 8s — launch FAILED (frozen app likely crashed on import/Tk-init)."
+      kill "$WRAPPER_PID" 2>/dev/null || true
+      wait "$WRAPPER_PID" 2>/dev/null || true
+      exit 1
+    fi
+
+- name: Launch smoke test (GUI) - macOS (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    BIN="$INSTALLED_APP/Contents/MacOS/${APP_NAME}"
+    echo "Launching bundle executable: $BIN"
+    "$BIN" &
+    APP_PID=$!
+    sleep 8
+    if kill -0 "$APP_PID" 2>/dev/null; then
+      echo "App process $APP_PID is alive after 8s — launch OK."
+      kill "$APP_PID" 2>/dev/null || true
+      wait "$APP_PID" 2>/dev/null || true
+    else
+      wait "$APP_PID"; CODE=$?
+      echo "::error::App exited prematurely (code $CODE) — launch FAILED."
+      exit 1
+    fi
+
+- name: Launch smoke test (GUI) - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    Write-Host "Launching: $env:INSTALLED_EXE"
+    $proc = Start-Process -FilePath $env:INSTALLED_EXE -PassThru
+    Start-Sleep -Seconds 8
+    $live = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+    if ($null -eq $live) {
+      throw "GUI exited prematurely (exit code $($proc.ExitCode)) — launch FAILED."
+    }
+    Write-Host "GUI process $($proc.Id) is alive after 8s — launch OK."
+    Stop-Process -Id $proc.Id -Force
+
+# ---------------------------------------------------------------------------
+# G6: REAL UPGRADE. Download the latest PUBLISHED release zip to create
+# genuine dirty/prior state, install it, then extract the freshly-built
+# version over the same install dir. Graceful skip if no release exists.
+# G3: correct release-download URL with proper slashes.
+# ---------------------------------------------------------------------------
+- name: Upgrade over previous release - Unix (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os != 'Windows'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -euo pipefail
+    # Distinguish "no releases exist yet" (legit skip) from a real gh/network/auth
+    # failure (must FAIL). Capture stderr instead of swallowing it with 2>/dev/null.
+    if TAG="$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName 2>/tmp/gh_err.txt)"; then
+      :
+    else
+      if grep -qiE 'release not found|no release|not found' /tmp/gh_err.txt; then
+        echo "::notice::No prior release found — skipping upgrade test (nothing to upgrade from)."
+        exit 0
+      fi
+      echo "::error::gh release view failed (not a 'no releases' condition):"
+      cat /tmp/gh_err.txt
+      exit 1
+    fi
+    if [ -z "$TAG" ]; then
+      echo "::notice::No prior release found — skipping upgrade test (nothing to upgrade from)."
+      exit 0
+    fi
+    echo "Latest published release: $TAG"
+    # Fetch the asset list once. A gh failure here must FAIL (not silently skip):
+    # gh runs under -e, so a non-zero exit aborts the job before any grep.
+    ASSET_LIST="$(gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name')"
+    OS_TOKEN="$(echo "${{ runner.os }}" | tr 'A-Z' 'a-z')"
+    # Prefer an OS- or app-name-matched .zip; else fall back to the first .zip.
+    ASSET="$(printf '%s\n' "$ASSET_LIST" | grep -iE '\.zip$' | grep -i "${OS_TOKEN}\|${APP_NAME}" | head -n1 || true)"
+    if [ -z "$ASSET" ]; then
+      ASSET="$(printf '%s\n' "$ASSET_LIST" | grep -iE '\.zip$' | head -n1 || true)"
+    fi
+    if [ -z "$ASSET" ]; then
+      echo "::notice::Release $TAG has no .zip asset — skipping upgrade test."
+      exit 0
+    fi
+    URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${ASSET}"
+    echo "Downloading previous version: $URL"
+    rm -rf /tmp/prev; mkdir -p /tmp/prev
+    # Download failure must FAIL the job (do not swallow). gh exits non-zero under -e.
+    gh release download "$TAG" --repo "${{ github.repository }}" --pattern "$ASSET" --dir /tmp/prev --clobber
+    # G2-style hard assert: the prior-release asset really landed before we use it.
+    if [ ! -f "/tmp/prev/$ASSET" ]; then
+      echo "::error::Prior-release download did not produce /tmp/prev/$ASSET"
+      ls -la /tmp/prev || true
+      exit 1
+    fi
+    # Install the OLD version into the install dir to create dirty state.
+    rm -rf "$INSTALL_DIR"; mkdir -p "$INSTALL_DIR"
+    rm -rf /tmp/prev/extracted
+    unzip -q "/tmp/prev/$ASSET" -d /tmp/prev/extracted
+    # G6/G8: strip Gatekeeper quarantine from the downloaded (unsigned) prior
+    # release on macOS so it does not hard-fail; signing stays warn-only.
+    if [ "${{ runner.os }}" = "macOS" ]; then
+      xattr -dr com.apple.quarantine /tmp/prev/extracted 2>/dev/null || true
+    fi
+    SRC="$(find /tmp/prev/extracted -maxdepth 2 -type d -name "${APP_NAME}*" | head -n1)"
+    [ -z "$SRC" ] && SRC="/tmp/prev/extracted"
+    cp -R "$SRC/." "$INSTALL_DIR/" 2>/dev/null || cp -R "$SRC" "$INSTALL_DIR/"
+    echo "OLD-VERSION-MARKER" > "$INSTALL_DIR/.previous_install_marker"
+    echo "Old version staged. Now upgrading with freshly built artifact..."
+    # Upgrade: overlay the new build.
+    if [ "${{ runner.os }}" = "macOS" ]; then
+      rm -rf "$INSTALL_DIR/${APP_NAME}.app"
+      cp -R "dist/${APP_NAME}.app" "$INSTALL_DIR/" 2>/dev/null || cp -R "dist/${APP_NAME}.app" "$INSTALL_DIR/${APP_NAME}.app"
+      test -d "$INSTALL_DIR/${APP_NAME}.app"
+    else
+      cp -R "dist/${APP_NAME}/." "$INSTALL_DIR/"
+      test -x "$INSTALL_DIR/${APP_NAME}"
+    fi
+    # The stale marker proving a real prior install existed should still be present (overlay upgrade).
+    if [ -f "$INSTALL_DIR/.previous_install_marker" ]; then
+      echo "Upgrade performed over a genuine prior install (marker present)."
+    fi
+    echo "Upgrade OK."
+
+- name: Upgrade over previous release - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # Distinguish "no releases exist yet" (legit skip) from a real gh failure
+    # (must FAIL). Capture stderr instead of discarding it with 2>$null.
+    $tag = (gh release view --repo "${{ github.repository }}" --json tagName -q .tagName 2>$env:TEMP\gh_err.txt)
+    if ($LASTEXITCODE -ne 0) {
+      $errText = (Get-Content $env:TEMP\gh_err.txt -Raw -ErrorAction SilentlyContinue)
+      if ($errText -match '(?i)release not found|no release|not found') {
+        Write-Host "::notice::No prior release found — skipping upgrade test (nothing to upgrade from)."
+        exit 0
+      }
+      Write-Host "::error::gh release view failed (not a 'no releases' condition):"
+      Write-Host $errText
+      exit 1
+    }
+    if ([string]::IsNullOrWhiteSpace($tag)) {
+      Write-Host "::notice::No prior release found — skipping upgrade test (nothing to upgrade from)."
+      exit 0
+    }
+    Write-Host "Latest published release: $tag"
+    $assets = (gh release view $tag --repo "${{ github.repository }}" --json assets -q '.assets[].name') -split "`n" | Where-Object { $_ -match '\.zip$' }
+    $asset = $assets | Select-Object -First 1
+    if (-not $asset) {
+      Write-Host "::notice::Release $tag has no .zip asset — skipping upgrade test."
+      exit 0
+    }
+    $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$asset"
+    Write-Host "Downloading previous version: $url"
+    if (Test-Path "$env:TEMP\prev") { Remove-Item -Recurse -Force "$env:TEMP\prev" }
+    New-Item -ItemType Directory -Force -Path "$env:TEMP\prev" | Out-Null
+    gh release download $tag --repo "${{ github.repository }}" --pattern $asset --dir "$env:TEMP\prev" --clobber
+    if ($LASTEXITCODE -ne 0) { throw "Prior-release download failed (gh exit $LASTEXITCODE)." }
+    $assetPath = Join-Path "$env:TEMP\prev" $asset
+    if (-not (Test-Path $assetPath)) { throw "Prior-release download did not produce $assetPath" }
+    # Install OLD version to create dirty state.
+    if (Test-Path $env:INSTALL_DIR) { Remove-Item -Recurse -Force $env:INSTALL_DIR }
+    New-Item -ItemType Directory -Force -Path $env:INSTALL_DIR | Out-Null
+    Expand-Archive -Path $assetPath -DestinationPath "$env:TEMP\prev\extracted" -Force
+    $src = Get-ChildItem "$env:TEMP\prev\extracted" -Directory | Where-Object { $_.Name -like "$env:APP_NAME*" } | Select-Object -First 1
+    if (-not $src) { $src = Get-Item "$env:TEMP\prev\extracted" }
+    Copy-Item -Recurse -Force "$($src.FullName)\*" $env:INSTALL_DIR
+    "OLD-VERSION-MARKER" | Out-File (Join-Path $env:INSTALL_DIR ".previous_install_marker") -Encoding utf8
+    Write-Host "Old version staged. Upgrading with freshly built artifact..."
+    Copy-Item -Recurse -Force "dist/$env:APP_NAME/*" $env:INSTALL_DIR
+    $exe = Join-Path $env:INSTALL_DIR "$env:APP_NAME.exe"
+    if (-not (Test-Path $exe)) { throw "Upgrade failed: $exe missing after overlay." }
+    if (Test-Path (Join-Path $env:INSTALL_DIR ".previous_install_marker")) {
+      Write-Host "Upgrade performed over a genuine prior install (marker present)."
+    }
+    Write-Host "Upgrade OK."
+
+# ---------------------------------------------------------------------------
+# G7: REAL UNINSTALL + negative assertion that nothing remains.
+# PyInstaller "uninstall" = remove the install dir; we then assert it is gone.
+# ---------------------------------------------------------------------------
+- name: Uninstall and verify removal - Unix (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "Removing $INSTALL_DIR"
+    rm -rf "$INSTALL_DIR"
+    if [ -e "$INSTALL_DIR" ]; then
+      echo "::error::Uninstall incomplete — $INSTALL_DIR still exists."
+      ls -la "$INSTALL_DIR" || true
+      exit 1
+    fi
+    if [ "${{ runner.os }}" = "macOS" ] && [ -e "$HOME/Applications/${APP_NAME}.app" ]; then
+      echo "::error::Uninstall incomplete — ${APP_NAME}.app still present."
+      exit 1
+    fi
+    echo "Uninstall verified: all files removed."
+
+- name: Uninstall and verify removal - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    Write-Host "Removing $env:INSTALL_DIR"
+    if (Test-Path $env:INSTALL_DIR) { Remove-Item -Recurse -Force $env:INSTALL_DIR }
+    if (Test-Path $env:INSTALL_DIR) {
+      Write-Host "::error::Uninstall incomplete — $env:INSTALL_DIR still exists."
+      Get-ChildItem -Recurse $env:INSTALL_DIR | Select-Object FullName
+      exit 1
+    }
+    Write-Host "Uninstall verified: all files removed."
+
+# ---------------------------------------------------------------------------
+# TRIPWIRE: a SUCCESSFUL full lifecycle (build -> install -> launch -> upgrade
+# -> uninstall+verify) sets LIFECYCLE_OK=1. The lifecycle is per-OS, so each OS
+# leg sets the marker only after ITS uninstall verification passes. An all-skip
+# leg never reaches here, so a downstream gate can catch a recipe that went
+# green while testing nothing.
+# ---------------------------------------------------------------------------
+- name: Lifecycle tripwire marker - Unix (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+    echo "Lifecycle complete: LIFECYCLE_OK=1"
+
+- name: Lifecycle tripwire marker - Windows (pyinstaller)
+  if: matrix.type == 'pyinstaller' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Lifecycle complete: LIFECYCLE_OK=1"

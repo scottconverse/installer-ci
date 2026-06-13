@@ -1,0 +1,468 @@
+# =====================================================================
+# deb-rpm installer slice  (Linux-only: .deb on Debian/Ubuntu family,
+# .rpm on RedHat/Fedora family). Real producer in this account is
+# klodock (Tauri -> bundle targets include "deb"/"appimage"); Tauri
+# can also emit "rpm". These are GUI desktop apps, so LAUNCH is a real
+# headless GUI launch (G5), not --version.
+#
+# Strategy on GitHub-hosted ubuntu-latest:
+#   * .deb  -> built + installed + launched NATIVELY (apt/dpkg).
+#   * .rpm  -> built on the host (rpmbuild/tauri rpm target), then
+#              installed + launched inside a fedora:latest container
+#              on the SAME runner (dnf/rpm). GitHub does not offer an
+#              rpm-native hosted runner, so the container is the
+#              idiomatic way to exercise the RedHat code path for real.
+#
+# G8 note: .deb/.rpm do NOT use macOS Gatekeeper / Windows Authenticode.
+# Their signing is GPG (debsigs / dpkg-sig for .deb, `rpm --checksig`
+# for .rpm). On public CI without GPG secrets we do a structural check
+# and WARN (never hard-fail).
+#
+# matrix.type guard "deb-rpm" is on EVERY step. runner.os guard pins
+# Linux. APP / PKG / BIN names are placeholders — wire to your repo.
+# =====================================================================
+
+- name: (deb-rpm) Guard - this type is Linux only
+  if: matrix.type == 'deb-rpm' && runner.os != 'Linux'
+  shell: bash
+  run: |
+    echo "::error::deb-rpm slice scheduled on non-Linux runner (${{ runner.os }}). .deb/.rpm are Linux-only; fix the matrix include." >&2
+    exit 1
+
+- name: (deb-rpm) Checkout
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  uses: actions/checkout@v4
+
+# --- Build toolchain: Node (Tauri frontend) + Rust + Tauri Linux deps.
+# Adjust/remove if your producer uses nfpm/fpm/cargo-deb instead.
+- name: (deb-rpm) Setup Node
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+
+- name: (deb-rpm) Setup Rust
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  uses: dtolnay/rust-toolchain@stable
+
+- name: (deb-rpm) Install Linux build dependencies (Tauri + rpmbuild)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get update
+    # Tauri 2.x Linux deps (webkit2gtk-4.1). For Tauri 1.x use libwebkit2gtk-4.0-dev.
+    sudo apt-get install -y --no-install-recommends \
+      libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev \
+      librsvg2-dev patchelf \
+      rpm dpkg-dev debsigs
+
+# ---------------------------------------------------------------------
+# G2: BUILD BOTH ARTIFACTS IN-JOB. Never assume a packaged file exists.
+# Tauri emits .deb under target/release/bundle/deb and .rpm under
+# target/release/bundle/rpm when those targets are configured.
+# ---------------------------------------------------------------------
+- name: (deb-rpm) Build .deb and .rpm artifacts
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    npm ci
+    # Build both Linux package targets explicitly (overrides config so we
+    # always get .deb AND .rpm regardless of tauri.conf defaults).
+    npx tauri build --bundles deb,rpm
+    echo "---- produced bundles ----"
+    find src-tauri/target/release/bundle -type f \( -name '*.deb' -o -name '*.rpm' \) -print
+
+# G2 (assert exists) + collect canonical paths for later steps.
+- name: (deb-rpm) Verify artifacts exist and export paths
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    DEB="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb' | head -n1)"
+    RPM="$(find src-tauri/target/release/bundle/rpm -maxdepth 1 -name '*.rpm' | head -n1)"
+    if [ -z "${DEB:-}" ] || [ ! -s "$DEB" ]; then
+      echo "::error::No non-empty .deb artifact produced (looked in bundle/deb)." >&2
+      exit 1
+    fi
+    if [ -z "${RPM:-}" ] || [ ! -s "$RPM" ]; then
+      echo "::error::No non-empty .rpm artifact produced (looked in bundle/rpm)." >&2
+      exit 1
+    fi
+    echo "Found DEB: $DEB ($(stat -c%s "$DEB") bytes)"
+    echo "Found RPM: $RPM ($(stat -c%s "$RPM") bytes)"
+    # Stage to stable, predictable paths so later steps & the container don't re-glob.
+    mkdir -p "$GITHUB_WORKSPACE/_pkgs"
+    cp "$DEB" "$GITHUB_WORKSPACE/_pkgs/app.deb"
+    cp "$RPM" "$GITHUB_WORKSPACE/_pkgs/app.rpm"
+    {
+      echo "DEB_PATH=$GITHUB_WORKSPACE/_pkgs/app.deb"
+      echo "RPM_PATH=$GITHUB_WORKSPACE/_pkgs/app.rpm"
+    } >> "$GITHUB_ENV"
+
+# Structural sanity: the packages must actually be valid archives with metadata.
+- name: (deb-rpm) Inspect package metadata (structural integrity)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "==== .deb control metadata ===="
+    dpkg-deb --info "$DEB_PATH"
+    dpkg-deb --contents "$DEB_PATH" | head -n 40
+    echo "==== .rpm header metadata ===="
+    rpm -qpi "$RPM_PATH"
+    rpm -qpl "$RPM_PATH" | head -n 40
+
+# ---------------------------------------------------------------------
+# G8: SIGNING — GPG, not Gatekeeper/Authenticode. WARN, don't fail, on
+# public CI without signing secrets.
+# ---------------------------------------------------------------------
+- name: (deb-rpm) Verify package signatures (G8 - warn-only on public CI)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -uo pipefail   # NOTE: intentionally no -e; this step must never hard-fail.
+    echo "::group::.deb signature (debsigs / dpkg-sig)"
+    if debsigs --list "$DEB_PATH" 2>/dev/null | grep -q .; then
+      echo ".deb carries embedded signature(s):"
+      debsigs --list "$DEB_PATH" || true
+    else
+      echo "::warning::.deb is UNSIGNED (no debsigs signature). Acceptable on public CI without a GPG secret; sign before public release."
+    fi
+    echo "::endgroup::"
+    echo "::group::.rpm signature (rpm --checksig)"
+    SIG="$(rpm -qp --qf '%{SIGPGP:pgpsig}%{SIGGPG:pgpsig}\n' "$RPM_PATH" 2>/dev/null || true)"
+    if rpm --checksig "$RPM_PATH" 2>/dev/null | grep -qiE 'pgp|gpg|signatures? OK' && [ -n "${SIG}" ] && [ "${SIG}" != "(none)(none)" ]; then
+      echo ".rpm is GPG-signed:"
+      rpm --checksig "$RPM_PATH" || true
+    else
+      echo "::warning::.rpm is UNSIGNED (rpm --checksig shows no PGP/GPG key). Acceptable on public CI without a GPG secret; sign before public release."
+      rpm --checksig "$RPM_PATH" || true
+    fi
+    echo "::endgroup::"
+
+# =====================================================================
+# DEBIAN / UBUNTU PATH (.deb) — native install / launch / upgrade /
+# uninstall. .deb has a real scope distinction: system-scope install
+# (dpkg/apt, files under /usr) vs user-scope extraction (dpkg-deb -x).
+# We test the real-world path = system-scope via apt.
+# =====================================================================
+
+# G6 PREP: install a REAL previous release FIRST to create dirty state.
+# Graceful skip if no prior release / asset exists.
+- name: (deb-rpm) [.deb] Upgrade prep - install previous published release
+  id: deb_prev
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -uo pipefail
+    PREV_TAG="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+    if [ -z "${PREV_TAG:-}" ] || [ "${PREV_TAG}" = "null" ]; then
+      echo "::notice::(deb-rpm) [.deb] No previous release found; upgrade test SKIPPED (clean-machine install is NOT an upgrade test)."
+      echo "have_prev=false" >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+    echo "Previous release tag: $PREV_TAG"
+    set -e
+    # Download the latest published .deb asset for that release. Do NOT swallow
+    # errors: distinguish "no .deb asset" (legit skip) from a real download
+    # failure (must fail, not silently green-skip) (G6).
+    if gh release download "$PREV_TAG" --repo "${{ github.repository }}" \
+         --pattern '*.deb' --dir "$GITHUB_WORKSPACE/_prev" --clobber; then
+      DL_RC=0
+    else
+      DL_RC=$?
+    fi
+    PREV_DEB="$(find "$GITHUB_WORKSPACE/_prev" -name '*.deb' 2>/dev/null | head -n1 || true)"
+    if [ "$DL_RC" -ne 0 ]; then
+      if [ -z "${PREV_DEB:-}" ]; then
+        echo "::notice::(deb-rpm) [.deb] Release $PREV_TAG has no .deb asset; upgrade test SKIPPED."
+        echo "have_prev=false" >> "$GITHUB_OUTPUT"
+        exit 0
+      fi
+      echo "::error::(deb-rpm) [.deb] gh release download for $PREV_TAG failed (rc=$DL_RC); refusing to silently skip the upgrade test." >&2
+      exit 1
+    fi
+    if [ -z "${PREV_DEB:-}" ]; then
+      echo "::notice::(deb-rpm) [.deb] Release $PREV_TAG has no .deb asset; upgrade test SKIPPED."
+      echo "have_prev=false" >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+    sudo apt-get install -y "$PREV_DEB"
+    echo "Installed previous .deb to create dirty upgrade state:"
+    dpkg -l | grep -i "${PKG_NAME:-klodock}" || true
+    echo "have_prev=true" >> "$GITHUB_OUTPUT"
+    echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
+# G6: REAL UPGRADE over the dirty state (only if prev was installed).
+- name: (deb-rpm) [.deb] UPGRADE current package over previous (G6)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux' && steps.deb_prev.outputs.have_prev == 'true'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # apt install on a .deb path performs an in-place upgrade over the prior version.
+    sudo apt-get install -y "$DEB_PATH"
+    echo "Post-upgrade installed version:"
+    dpkg-query -W -f='${Package} ${Version}\n' "${PKG_NAME:-klodock}"
+
+# G1: CLEAN INSTALL when there was no previous release (still must exercise install).
+- name: (deb-rpm) [.deb] INSTALL current package (clean, no prior release)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux' && steps.deb_prev.outputs.have_prev != 'true'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # apt-get install resolves deps; dpkg -i alone would fail on missing deps.
+    sudo apt-get install -y "$DEB_PATH"
+    echo "Installed version:"
+    dpkg-query -W -f='${Package} ${Version}\n' "${PKG_NAME:-klodock}"
+
+# Verify install landed real files in system scope (negative-safe positive assertion).
+- name: (deb-rpm) [.deb] Verify installed files present (system scope)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Resolve the installed binary path from the package's file list.
+    BIN="$(dpkg -L "${PKG_NAME:-klodock}" | grep -E '/usr/bin/' | head -n1 || true)"
+    if [ -z "${BIN:-}" ]; then
+      echo "::error::No /usr/bin entry owned by package after install." >&2
+      dpkg -L "${PKG_NAME:-klodock}" || true
+      exit 1
+    fi
+    test -x "$BIN" || { echo "::error::Installed binary $BIN is not executable." >&2; exit 1; }
+    echo "INSTALLED_BIN=$BIN" >> "$GITHUB_ENV"
+    echo "Installed binary: $BIN"
+
+# G5: REAL HEADLESS GUI LAUNCH for the .deb-installed app (it's a Tauri GUI).
+# --version alone is INSUFFICIENT for a GUI app. Launch under Xvfb and
+# assert the process actually starts and stays alive.
+- name: (deb-rpm) [.deb] Install headless display deps
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get install -y --no-install-recommends xvfb
+
+- name: (deb-rpm) [.deb] LAUNCH installed GUI app headless and assert alive (G5)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # WebKitGTK under Xvfb on CI: disable GPU/sandbox/compositing.
+    export WEBKIT_DISABLE_COMPOSITING_MODE=1
+    export WEBKIT_DISABLE_DMABUF_RENDERER=1
+    export LIBGL_ALWAYS_SOFTWARE=1
+    set +e
+    # NOTE: $! is the PID of the xvfb-run WRAPPER, not the installed app, so we
+    # must NOT assert on it (the wrapper can outlive a crashed app = false pass).
+    # We launch under Xvfb and verify the REAL installed binary by its full path
+    # via pgrep -f, so a loose basename can't match an unrelated process (G5).
+    xvfb-run -a --server-args="-screen 0 1280x1024x24" "$INSTALLED_BIN" &
+    WRAP_PID=$!
+    # Give the GUI time to initialize its window/webview, then confirm the real app
+    # process (matched on its full install path) is actually running.
+    APP_PID=""
+    for i in $(seq 1 10); do
+      sleep 1
+      APP_PID="$(pgrep -f "$INSTALLED_BIN" | head -n1 || true)"
+      if [ -n "$APP_PID" ]; then break; fi
+      # If the wrapper itself died before the app ever appeared, stop waiting.
+      kill -0 "$WRAP_PID" 2>/dev/null || break
+    done
+    if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+      echo "PASS: installed GUI app alive after startup window (app pid $APP_PID, path $INSTALLED_BIN)."
+      kill -TERM "$APP_PID" 2>/dev/null || true
+      kill -TERM "$WRAP_PID" 2>/dev/null || true
+      wait "$WRAP_PID" 2>/dev/null || true
+      exit 0
+    fi
+    # The real app process never came up (or died). A wrapper that is still alive
+    # while the app is gone is NOT a pass — fail loudly (G1/G5).
+    kill -TERM "$WRAP_PID" 2>/dev/null || true
+    wait "$WRAP_PID" 2>/dev/null; RC=$?
+    echo "::error::Installed GUI app ($INSTALLED_BIN) did not stay alive under Xvfb (wrapper rc=$RC); not a real launch." >&2
+    exit 1
+
+# G7: REAL UNINSTALL + negative assertion that files are GONE.
+- name: (deb-rpm) [.deb] UNINSTALL and assert full removal (G7)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # purge removes config too; verify package + binary are gone afterwards.
+    sudo apt-get purge -y "${PKG_NAME:-klodock}"
+    if dpkg-query -W -f='${Status}\n' "${PKG_NAME:-klodock}" 2>/dev/null | grep -q "install ok installed"; then
+      echo "::error::Package still registered as installed after purge." >&2
+      exit 1
+    fi
+    if [ -n "${INSTALLED_BIN:-}" ] && [ -e "$INSTALLED_BIN" ]; then
+      echo "::error::Binary $INSTALLED_BIN still present after uninstall." >&2
+      exit 1
+    fi
+    echo "PASS: .deb fully removed (package deregistered, binary gone)."
+
+# =====================================================================
+# REDHAT / FEDORA PATH (.rpm) — install / launch / upgrade / uninstall
+# inside a fedora:latest container on the SAME ubuntu-latest runner.
+# This is the idiomatic way to exercise the dnf/rpm code path for real
+# without an rpm-native hosted runner.
+# =====================================================================
+
+# G6 PREP (rpm): fetch previous release .rpm on the host (gh available here),
+# so the container can install it from a file. Graceful skip if none.
+- name: (deb-rpm) [.rpm] Upgrade prep - fetch previous published .rpm
+  id: rpm_prev
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -uo pipefail
+    PREV_TAG="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+    if [ -z "${PREV_TAG:-}" ] || [ "${PREV_TAG}" = "null" ]; then
+      echo "::notice::(deb-rpm) [.rpm] No previous release found; .rpm upgrade test SKIPPED (clean install is NOT an upgrade test)."
+      echo "have_prev=false" >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+    set -e
+    # Distinguish "release has no .rpm asset" (legit skip) from a real download
+    # failure. Do NOT swallow download errors with '|| true' — a failed download
+    # must fail the step, not silently degrade to a green skip (G6).
+    if gh release download "$PREV_TAG" --repo "${{ github.repository }}" \
+         --pattern '*.rpm' --dir "$GITHUB_WORKSPACE/_prev_rpm" --clobber; then
+      DL_RC=0
+    else
+      DL_RC=$?
+    fi
+    PREV_RPM="$(find "$GITHUB_WORKSPACE/_prev_rpm" -name '*.rpm' 2>/dev/null | head -n1 || true)"
+    if [ "$DL_RC" -ne 0 ]; then
+      # gh exits non-zero with "no assets matched" when the release simply has no
+      # .rpm — treat that one case as a legitimate skip; any other failure is real.
+      if [ -z "${PREV_RPM:-}" ]; then
+        echo "::notice::(deb-rpm) [.rpm] Release $PREV_TAG has no .rpm asset; .rpm upgrade test SKIPPED."
+        echo "have_prev=false" >> "$GITHUB_OUTPUT"
+        exit 0
+      fi
+      echo "::error::(deb-rpm) [.rpm] gh release download for $PREV_TAG failed (rc=$DL_RC); refusing to silently skip the upgrade test." >&2
+      exit 1
+    fi
+    if [ -z "${PREV_RPM:-}" ]; then
+      echo "::notice::(deb-rpm) [.rpm] Release $PREV_TAG has no .rpm asset; .rpm upgrade test SKIPPED."
+      echo "have_prev=false" >> "$GITHUB_OUTPUT"
+      exit 0
+    fi
+    cp "$PREV_RPM" "$GITHUB_WORKSPACE/_pkgs/prev.rpm"
+    echo "have_prev=true" >> "$GITHUB_OUTPUT"
+
+# Single container run exercises the full RedHat lifecycle idiomatically
+# (one shell = bash on host invoking the container; G4 respected — the
+# in-container script is bash, no shell mixing).
+- name: (deb-rpm) [.rpm] Install / launch / upgrade / uninstall in Fedora container
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  env:
+    HAVE_PREV: ${{ steps.rpm_prev.outputs.have_prev }}
+    PKG_NAME: ${{ env.PKG_NAME || 'klodock' }}
+  run: |
+    set -euo pipefail
+    docker run --rm \
+      -e HAVE_PREV \
+      -e PKG_NAME \
+      -v "$GITHUB_WORKSPACE/_pkgs:/pkgs:ro" \
+      fedora:latest bash -euo pipefail -c '
+        echo "==== Fedora RedHat-family .rpm lifecycle ===="
+        # Headless GUI + webkit deps for a real launch (G5) inside the container.
+        dnf -y install xorg-x11-server-Xvfb webkit2gtk4.1 gtk3 librsvg2 procps-ng >/dev/null
+
+        # ---- G6: REAL UPGRADE over a genuine previous version (if available) ----
+        if [ "${HAVE_PREV}" = "true" ] && [ -f /pkgs/prev.rpm ]; then
+          echo "Installing previous .rpm to create dirty upgrade state..."
+          dnf -y install /pkgs/prev.rpm
+          echo "Pre-upgrade version:"; rpm -q "${PKG_NAME}" || true
+          echo "Upgrading to current .rpm..."
+          # Exactly ONE command path for the upgrade. Do NOT mask a real upgrade
+          # failure with "|| dnf reinstall" — that fallback turns a broken upgrade
+          # green. "dnf install <file>" upgrades in place when a prior version is
+          # present and is the single idempotent path that must succeed.
+          dnf -y install /pkgs/app.rpm
+        else
+          echo "No previous .rpm release; performing CLEAN install (not an upgrade test)."
+          dnf -y install /pkgs/app.rpm
+        fi
+
+        # ---- Verify install + locate binary (positive assertion) ----
+        echo "Post-install package query:"; rpm -q "${PKG_NAME}"
+        BIN="$(rpm -ql "${PKG_NAME}" | grep -E "^/usr/bin/" | head -n1 || true)"
+        if [ -z "${BIN}" ] || [ ! -x "${BIN}" ]; then
+          echo "::error::No executable /usr/bin entry owned by ${PKG_NAME} after .rpm install." >&2
+          rpm -ql "${PKG_NAME}" || true
+          exit 1
+        fi
+        echo "Installed binary: ${BIN}"
+
+        # ---- G5: REAL HEADLESS GUI LAUNCH inside the container ----
+        export WEBKIT_DISABLE_COMPOSITING_MODE=1
+        export WEBKIT_DISABLE_DMABUF_RENDERER=1
+        export LIBGL_ALWAYS_SOFTWARE=1
+        set +e
+        # $! is the xvfb-run WRAPPER pid, not the app — asserting on it is a false
+        # pass. Verify the REAL installed binary by its full path via pgrep -f (G5).
+        xvfb-run -a --server-args="-screen 0 1280x1024x24" "${BIN}" &
+        WRAP_PID=$!
+        APP_PID=""
+        for i in $(seq 1 10); do
+          sleep 1
+          APP_PID="$(pgrep -f "${BIN}" | head -n1 || true)"
+          [ -n "${APP_PID}" ] && break
+          kill -0 "${WRAP_PID}" 2>/dev/null || break
+        done
+        if [ -n "${APP_PID}" ] && kill -0 "${APP_PID}" 2>/dev/null; then
+          echo "PASS: .rpm GUI app alive after startup (app pid ${APP_PID}, path ${BIN})."
+          kill -TERM "${APP_PID}" 2>/dev/null || true
+          kill -TERM "${WRAP_PID}" 2>/dev/null || true
+          wait "${WRAP_PID}" 2>/dev/null || true
+        else
+          kill -TERM "${WRAP_PID}" 2>/dev/null || true
+          wait "${WRAP_PID}" 2>/dev/null; RC=$?
+          echo "::error::.rpm GUI app (${BIN}) did not stay alive under Xvfb (wrapper rc=${RC}); not a real launch." >&2
+          exit 1
+        fi
+        set -e
+
+        # ---- G7: REAL UNINSTALL + negative assertion ----
+        dnf -y remove "${PKG_NAME}"
+        if rpm -q "${PKG_NAME}" >/dev/null 2>&1; then
+          echo "::error::${PKG_NAME} still installed after dnf remove." >&2
+          exit 1
+        fi
+        if [ -e "${BIN}" ]; then
+          echo "::error::Binary ${BIN} still present after .rpm uninstall." >&2
+          exit 1
+        fi
+        echo "PASS: .rpm fully removed (package gone, binary gone)."
+      '
+
+# REQUIRED tripwire: only reached if BOTH the .deb and .rpm lifecycles above ran
+# and uninstall-verified without failing. Sets a marker so an all-skip / all-green
+# leg that tested nothing is caught downstream. Linux is the only OS this type runs.
+- name: (deb-rpm) Mark lifecycle complete (tripwire)
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+    echo "deb-rpm full lifecycle (build + .deb install/launch/uninstall + .rpm container install/launch/uninstall) completed."
+
+# Optional: publish the built packages for downstream release jobs / debugging.
+- name: (deb-rpm) Upload built packages as workflow artifacts
+  if: matrix.type == 'deb-rpm' && runner.os == 'Linux'
+  uses: actions/upload-artifact@v4
+  with:
+    name: deb-rpm-packages
+    path: |
+      ${{ github.workspace }}/_pkgs/app.deb
+      ${{ github.workspace }}/_pkgs/app.rpm
+    if-no-files-found: error

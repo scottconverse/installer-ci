@@ -1,0 +1,458 @@
+- name: Checkout
+  if: matrix.type == 'python-pip-wheel'
+  uses: actions/checkout@v4
+
+- name: Set up Python
+  if: matrix.type == 'python-pip-wheel'
+  uses: actions/setup-python@v5
+  with:
+    python-version: '3.12'
+
+# ---------------------------------------------------------------------------
+# BUILD (G2): never assume dist/ exists. Build the wheel + sdist in-job with a
+# PEP 517 frontend. Backend (hatchling/setuptools/flit) is auto-read from
+# [build-system] in pyproject.toml. One shell per step (G4).
+# ---------------------------------------------------------------------------
+- name: Install build tooling
+  if: matrix.type == 'python-pip-wheel'
+  shell: bash
+  run: |
+    set -euo pipefail
+    python -m pip install --upgrade pip
+    python -m pip install --upgrade build twine
+
+- name: Build wheel and sdist
+  if: matrix.type == 'python-pip-wheel'
+  shell: bash
+  run: |
+    set -euo pipefail
+    rm -rf dist
+    # G1: `python -m build` runs in foreground; set -e turns a build crash red.
+    python -m build
+    echo "----- dist/ contents -----"
+    ls -al dist
+
+# G2: hard-assert the wheel artifact actually exists before we try to install
+# it. A build that silently produced nothing must fail here, not "pass" later.
+- name: Verify wheel artifact exists
+  if: matrix.type == 'python-pip-wheel'
+  shell: bash
+  run: |
+    set -euo pipefail
+    shopt -s nullglob
+    wheels=(dist/*.whl)
+    sdists=(dist/*.tar.gz)
+    if [ ${#wheels[@]} -eq 0 ]; then
+      echo "::error::No .whl produced in dist/ — build did not generate a wheel."
+      exit 1
+    fi
+    if [ ${#sdists[@]} -eq 0 ]; then
+      echo "::error::No sdist (.tar.gz) produced in dist/."
+      exit 1
+    fi
+    WHEEL="${wheels[0]}"
+    echo "WHEEL=$WHEEL" >> "$GITHUB_ENV"
+    echo "Found wheel: $WHEEL"
+    # Resolve the installed console-script / module name from package metadata so
+    # later launch/uninstall steps assert against the REAL entry point, not a guess.
+    # Capture into THIS shell first so we can hard-assert the values are non-empty
+    # (an empty DIST_NAME/IMPORT_NAME would make every downstream pip/import check
+    # pass vacuously — a classic false-pass). The import name comes from the wheel's
+    # top_level.txt (authoritative; e.g. Pillow -> PIL), not a dist-name guess.
+    META="$(python - "$WHEEL" <<'PY'
+    import sys, zipfile, configparser, re
+    whl = sys.argv[1]
+    dist = ""
+    top = ""
+    scripts = []
+    with zipfile.ZipFile(whl) as z:
+        names = z.namelist()
+        for n in names:
+            if n.endswith(".dist-info/METADATA"):
+                for line in z.read(n).decode("utf-8", "replace").splitlines():
+                    if line.startswith("Name:"):
+                        dist = line.split(":", 1)[1].strip()
+            if n.endswith(".dist-info/top_level.txt"):
+                tops = [l.strip() for l in z.read(n).decode("utf-8", "replace").splitlines() if l.strip()]
+                if tops:
+                    top = tops[0]
+            if n.endswith(".dist-info/entry_points.txt"):
+                cp = configparser.ConfigParser()
+                cp.read_string(z.read(n).decode("utf-8", "replace"))
+                if cp.has_section("console_scripts"):
+                    scripts = list(cp.options("console_scripts"))
+    # Fall back to the normalized dist name only if top_level.txt is absent.
+    importname = top or (re.sub(r"[-.]+", "_", dist).lower() if dist else "")
+    print(f"DIST_NAME={dist}")
+    print(f"IMPORT_NAME={importname}")
+    print(f"CONSOLE_SCRIPT={scripts[0] if scripts else ''}")
+    PY
+    )"
+    echo "$META"
+    DIST_NAME="$(printf '%s\n' "$META" | sed -n 's/^DIST_NAME=//p')"
+    IMPORT_NAME="$(printf '%s\n' "$META" | sed -n 's/^IMPORT_NAME=//p')"
+    CONSOLE_SCRIPT="$(printf '%s\n' "$META" | sed -n 's/^CONSOLE_SCRIPT=//p')"
+    # G2: hard-assert we actually resolved a distribution + import name. Without
+    # these the launch/uninstall negative assertions are meaningless.
+    if [ -z "$DIST_NAME" ] || [ -z "$IMPORT_NAME" ]; then
+      echo "::error::Could not resolve DIST_NAME/IMPORT_NAME from wheel metadata ($WHEEL) — refusing to continue with empty identifiers."
+      exit 1
+    fi
+    {
+      echo "DIST_NAME=$DIST_NAME"
+      echo "IMPORT_NAME=$IMPORT_NAME"
+      echo "CONSOLE_SCRIPT=$CONSOLE_SCRIPT"
+    } >> "$GITHUB_ENV"
+    echo "Resolved: dist=$DIST_NAME import=$IMPORT_NAME script=${CONSOLE_SCRIPT:-<none>}"
+
+# G8: wheels have no Authenticode/Gatekeeper signing. The real integrity surface
+# is PEP 427 metadata + the RECORD manifest, plus optional PEP 740 / Sigstore
+# attestations. Do a STRUCTURAL check and WARN — never hard-fail on public CI
+# that has no signing secrets.
+- name: Verify wheel metadata and integrity (warn-only signing check)
+  if: matrix.type == 'python-pip-wheel'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # twine check validates METADATA / long_description rendering structurally.
+    if ! python -m twine check dist/*; then
+      echo "::warning::twine check reported metadata issues (non-blocking)."
+    fi
+    # Confirm a RECORD manifest exists (the wheel's built-in integrity manifest).
+    if python -c "import sys,zipfile; z=zipfile.ZipFile('$WHEEL'); sys.exit(0 if any(n.endswith('.dist-info/RECORD') for n in z.namelist()) else 1)"; then
+      echo "RECORD manifest present in wheel."
+    else
+      echo "::warning::No RECORD manifest found in wheel — integrity manifest missing."
+    fi
+    # Sigstore/PEP 740 attestations only exist for published-to-PyPI artifacts; on
+    # a local CI build there is no .publish attestation. Surface as a visible warning.
+    echo "::warning::Wheel is unsigned (no PEP 740/Sigstore attestation on local build). Structural integrity verified via RECORD/twine only."
+
+# ---------------------------------------------------------------------------
+# INSTALL — user-scope: a venv is pip's REAL per-user isolation boundary.
+# Separate steps per OS (G4); each idiomatic to its shell. G1 throughout.
+# ---------------------------------------------------------------------------
+- name: Install into user-scope venv (Linux/macOS)
+  if: matrix.type == 'python-pip-wheel' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    python -m venv "$HOME/venv-user"
+    # shellcheck disable=SC1091
+    source "$HOME/venv-user/bin/activate"
+    python -m pip install --upgrade pip
+    # Install the freshly built WHEEL explicitly (not the source tree) — G2.
+    python -m pip install "$WHEEL"
+    python -m pip show "$DIST_NAME"
+
+- name: Install into user-scope venv (Windows)
+  if: matrix.type == 'python-pip-wheel' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    python -m venv "$env:USERPROFILE\venv-user"
+    & "$env:USERPROFILE\venv-user\Scripts\Activate.ps1"
+    python -m pip install --upgrade pip
+    python -m pip install "$env:WHEEL"
+    python -m pip show "$env:DIST_NAME"
+    if ($LASTEXITCODE -ne 0) { throw "pip show failed (exit $LASTEXITCODE)" }
+
+# INSTALL — system-scope: pipx is the genuine "install this CLI globally on the
+# machine" path for a wheel (isolated env on PATH). Only meaningful when the
+# package ships a console_scripts entry point.
+- name: Install system-scope via pipx (Linux/macOS)
+  if: matrix.type == 'python-pip-wheel' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    if [ -z "${CONSOLE_SCRIPT:-}" ]; then
+      echo "No console_scripts entry point — skipping pipx (system-scope) install for this library-only package."
+      exit 0
+    fi
+    python -m pip install --user pipx
+    python -m pipx ensurepath
+    # G1: pipx returns nonzero on failure; set -e turns it red.
+    python -m pipx install "$WHEEL"
+    python -m pipx list
+
+- name: Install system-scope via pipx (Windows)
+  if: matrix.type == 'python-pip-wheel' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    if ([string]::IsNullOrEmpty($env:CONSOLE_SCRIPT)) {
+      Write-Host "No console_scripts entry point — skipping pipx (system-scope) install."
+      exit 0
+    }
+    python -m pip install --user pipx
+    python -m pipx ensurepath
+    python -m pipx install "$env:WHEEL"
+    if ($LASTEXITCODE -ne 0) { throw "pipx install failed (exit $LASTEXITCODE)" }
+    python -m pipx list
+
+# ---------------------------------------------------------------------------
+# LAUNCH / SMOKE-VERIFY (G5 applied to a CLI/library wheel): actually exercise
+# the installed software and assert it runs & exits 0 — `--version` alone is
+# not enough, so we also import the module and run a real CLI invocation.
+# ---------------------------------------------------------------------------
+- name: Launch / smoke-verify installed package (Linux/macOS)
+  if: matrix.type == 'python-pip-wheel' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$HOME/venv-user/bin/activate"
+    # 1) The package imports cleanly inside the install env (catches missing deps).
+    python -c "import importlib; m=importlib.import_module('$IMPORT_NAME'); print('import OK:', m.__name__)"
+    if [ -n "${CONSOLE_SCRIPT:-}" ]; then
+      # 2) The console script is on PATH and executable.
+      command -v "$CONSOLE_SCRIPT"
+      # 3) Real invocation — try --help (universal) and assert exit 0 (G1).
+      "$CONSOLE_SCRIPT" --help
+      # 4) --version too, but only as an ADDITIONAL signal, never the sole check.
+      "$CONSOLE_SCRIPT" --version || echo "::warning::$CONSOLE_SCRIPT has no --version flag (non-blocking)."
+    else
+      echo "Library-only wheel: import smoke test is the launch check."
+    fi
+    # If pipx installed it system-wide, verify that copy launches too.
+    if [ -n "${CONSOLE_SCRIPT:-}" ] && python -m pipx list 2>/dev/null | grep -q "$DIST_NAME"; then
+      "$HOME/.local/bin/$CONSOLE_SCRIPT" --help
+    fi
+
+- name: Launch / smoke-verify installed package (Windows)
+  if: matrix.type == 'python-pip-wheel' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    & "$env:USERPROFILE\venv-user\Scripts\Activate.ps1"
+    python -c "import importlib; m=importlib.import_module('$env:IMPORT_NAME'); print('import OK:', m.__name__)"
+    if ($LASTEXITCODE -ne 0) { throw "module import failed (exit $LASTEXITCODE)" }
+    if (-not [string]::IsNullOrEmpty($env:CONSOLE_SCRIPT)) {
+      $cmd = Get-Command $env:CONSOLE_SCRIPT -ErrorAction Stop
+      Write-Host "Console script resolved to: $($cmd.Source)"
+      # G1: capture exit code explicitly.
+      & $env:CONSOLE_SCRIPT --help
+      if ($LASTEXITCODE -ne 0) { throw "$env:CONSOLE_SCRIPT --help failed (exit $LASTEXITCODE)" }
+      & $env:CONSOLE_SCRIPT --version
+      if ($LASTEXITCODE -ne 0) { Write-Host "::warning::$env:CONSOLE_SCRIPT has no --version flag (non-blocking)." }
+    } else {
+      Write-Host "Library-only wheel: import smoke test is the launch check."
+    }
+
+# ---------------------------------------------------------------------------
+# UPGRADE (G6): create GENUINE dirty state by FIRST installing a real previous
+# release, then upgrade with the freshly built wheel. Graceful skip if no prior
+# release exists. We try the published GitHub release asset first, then fall
+# back to the latest version on PyPI — both are "a real previous version".
+# ---------------------------------------------------------------------------
+- name: Upgrade over previous published release (Linux/macOS)
+  if: matrix.type == 'python-pip-wheel' && runner.os != 'Windows'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -euo pipefail
+    python -m venv "$HOME/venv-upg"
+    # shellcheck disable=SC1091
+    source "$HOME/venv-upg/bin/activate"
+    python -m pip install --upgrade pip
+
+    PREV_INSTALLED=0
+    # (a) Try a previous wheel published as a GitHub release asset.
+    #     G6: distinguish "no releases exist yet" (legit skip) from "download
+    #     failed" (must FAIL). We DO NOT swallow the download error and silently
+    #     fall through — that would hide a broken release pipeline behind a green.
+    mkdir -p "$HOME/prevrel"
+    REL_COUNT=$(gh release list --repo "${{ github.repository }}" --limit 1 | wc -l | tr -d ' ')
+    if [ "$REL_COUNT" -gt 0 ]; then
+      # A release exists, so a download attempt MUST succeed. If the repo's latest
+      # release happens to carry no *.whl asset, that is also a real problem worth
+      # surfacing, so we only treat a clean download + present file as success.
+      if ! gh release download --repo "${{ github.repository }}" --pattern '*.whl' --dir "$HOME/prevrel"; then
+        echo "::error::A GitHub release exists but downloading its *.whl asset failed — not skipping (would hide a broken release)."
+        exit 1
+      fi
+      PREV_WHEEL=$(ls "$HOME/prevrel"/*.whl 2>/dev/null | head -n1 || true)
+      if [ -z "${PREV_WHEEL:-}" ]; then
+        echo "::error::GitHub release present but contained no *.whl asset to upgrade from."
+        exit 1
+      fi
+      python -m pip install "$PREV_WHEEL"
+      PREV_INSTALLED=1
+    else
+      echo "::notice::No GitHub releases yet for ${{ github.repository }} — trying PyPI for a prior version."
+    fi
+    # (b) Fall back to the latest version on PyPI as the "previous" release.
+    #     Distinguish "no such project on PyPI" (legit skip) from a network/index
+    #     error (must FAIL). pip exits 23 (no matching distribution) when the
+    #     project simply does not exist; any other nonzero is a real failure.
+    if [ "$PREV_INSTALLED" -eq 0 ]; then
+      set +e
+      PIP_OUT=$(python -m pip install "$DIST_NAME" 2>&1)
+      PIP_RC=$?
+      set -e
+      printf '%s\n' "$PIP_OUT"
+      if [ "$PIP_RC" -eq 0 ]; then
+        PREV_INSTALLED=1
+      elif printf '%s' "$PIP_OUT" | grep -qiE 'No matching distribution|Could not find a version|404'; then
+        echo "::notice::No prior GitHub release and $DIST_NAME is not on PyPI — skipping upgrade test (nothing to upgrade from)."
+        exit 0
+      else
+        echo "::error::Installing prior PyPI release of $DIST_NAME failed for a non-'missing' reason (pip rc=$PIP_RC) — failing rather than masking it."
+        exit 1
+      fi
+    fi
+
+    if [ "$PREV_INSTALLED" -eq 0 ]; then
+      echo "::notice::No prior GitHub release asset or PyPI release for $DIST_NAME — skipping upgrade test (nothing to upgrade from)."
+      exit 0
+    fi
+
+    OLD_VER=$(python -m pip show "$DIST_NAME" | awk -F': ' '/^Version:/{print $2}')
+    echo "Installed previous version: $OLD_VER (dirty state established)"
+    # Now perform the REAL upgrade with the freshly built wheel.
+    python -m pip install --upgrade --force-reinstall "$WHEEL"
+    NEW_VER=$(python -m pip show "$DIST_NAME" | awk -F': ' '/^Version:/{print $2}')
+    echo "Upgraded to version: $NEW_VER"
+    # Smoke-verify the upgraded install still launches.
+    python -c "import importlib; importlib.import_module('$IMPORT_NAME'); print('post-upgrade import OK')"
+    if [ -n "${CONSOLE_SCRIPT:-}" ]; then "$CONSOLE_SCRIPT" --help; fi
+
+- name: Upgrade over previous published release (Windows)
+  if: matrix.type == 'python-pip-wheel' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    python -m venv "$env:USERPROFILE\venv-upg"
+    & "$env:USERPROFILE\venv-upg\Scripts\Activate.ps1"
+    python -m pip install --upgrade pip
+
+    $prevInstalled = $false
+    New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\prevrel" | Out-Null
+    # (a) Previous wheel from a GitHub release asset.
+    #     G6: distinguish "no releases yet" (legit skip) from "download failed"
+    #     (must FAIL). Do NOT swallow the download error and silently fall through.
+    $relList = gh release list --repo "${{ github.repository }}" --limit 1
+    if ($LASTEXITCODE -ne 0) { throw "gh release list failed (exit $LASTEXITCODE)" }
+    if (-not [string]::IsNullOrWhiteSpace($relList)) {
+      gh release download --repo "${{ github.repository }}" --pattern '*.whl' --dir "$env:USERPROFILE\prevrel"
+      if ($LASTEXITCODE -ne 0) { throw "A GitHub release exists but downloading its *.whl asset failed (exit $LASTEXITCODE) — not skipping." }
+      $prevWheel = Get-ChildItem -Path "$env:USERPROFILE\prevrel" -Filter *.whl -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $prevWheel) { throw "GitHub release present but contained no *.whl asset to upgrade from." }
+      python -m pip install "$($prevWheel.FullName)"
+      if ($LASTEXITCODE -ne 0) { throw "installing prior release wheel failed (exit $LASTEXITCODE)" }
+      $prevInstalled = $true
+    } else {
+      Write-Host "::notice::No GitHub releases yet for ${{ github.repository }} — trying PyPI for a prior version."
+    }
+    # (b) Fall back to latest PyPI release. Distinguish "not on PyPI" (legit skip)
+    #     from a network/index error (must FAIL).
+    if (-not $prevInstalled) {
+      $pipOut = python -m pip install "$env:DIST_NAME" 2>&1 | Out-String
+      $pipRc = $LASTEXITCODE
+      Write-Host $pipOut
+      if ($pipRc -eq 0) {
+        $prevInstalled = $true
+      } elseif ($pipOut -match 'No matching distribution|Could not find a version|404') {
+        Write-Host "::notice::No prior GitHub release and $env:DIST_NAME is not on PyPI — skipping upgrade test (nothing to upgrade from)."
+        exit 0
+      } else {
+        throw "Installing prior PyPI release of $env:DIST_NAME failed for a non-'missing' reason (pip rc=$pipRc) — failing rather than masking it."
+      }
+    }
+    if (-not $prevInstalled) {
+      Write-Host "::notice::No prior GitHub release asset or PyPI release for $env:DIST_NAME — skipping upgrade test."
+      exit 0
+    }
+
+    $oldVer = (python -m pip show $env:DIST_NAME | Select-String '^Version:').ToString().Split(':')[1].Trim()
+    Write-Host "Installed previous version: $oldVer (dirty state established)"
+    python -m pip install --upgrade --force-reinstall "$env:WHEEL"
+    if ($LASTEXITCODE -ne 0) { throw "upgrade install failed (exit $LASTEXITCODE)" }
+    $newVer = (python -m pip show $env:DIST_NAME | Select-String '^Version:').ToString().Split(':')[1].Trim()
+    Write-Host "Upgraded to version: $newVer"
+    python -c "import importlib; importlib.import_module('$env:IMPORT_NAME'); print('post-upgrade import OK')"
+    if ($LASTEXITCODE -ne 0) { throw "post-upgrade import failed (exit $LASTEXITCODE)" }
+    if (-not [string]::IsNullOrEmpty($env:CONSOLE_SCRIPT)) {
+      & $env:CONSOLE_SCRIPT --help
+      if ($LASTEXITCODE -ne 0) { throw "post-upgrade launch failed (exit $LASTEXITCODE)" }
+    }
+
+# ---------------------------------------------------------------------------
+# UNINSTALL + NEGATIVE VERIFICATION (G7): remove from every scope we installed,
+# then ASSERT the import, console script, and dist metadata are GONE. Any
+# residue fails the job.
+# ---------------------------------------------------------------------------
+- name: Uninstall and verify full removal (Linux/macOS)
+  if: matrix.type == 'python-pip-wheel' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$HOME/venv-user/bin/activate"
+    python -m pip uninstall -y "$DIST_NAME"
+    # Negative assertion 1: metadata must be gone.
+    if python -m pip show "$DIST_NAME" >/dev/null 2>&1; then
+      echo "::error::pip still reports $DIST_NAME installed after uninstall."
+      exit 1
+    fi
+    # Negative assertion 2: import must now fail.
+    if python -c "import importlib; importlib.import_module('$IMPORT_NAME')" 2>/dev/null; then
+      echo "::error::Module $IMPORT_NAME still importable after uninstall."
+      exit 1
+    fi
+    # Negative assertion 3: console script must be gone from the venv.
+    if [ -n "${CONSOLE_SCRIPT:-}" ] && [ -e "$HOME/venv-user/bin/$CONSOLE_SCRIPT" ]; then
+      echo "::error::Console script $CONSOLE_SCRIPT still present in venv after uninstall."
+      exit 1
+    fi
+    echo "venv uninstall verified clean."
+    # Tear down system-scope pipx install too, with its own negative check.
+    if [ -n "${CONSOLE_SCRIPT:-}" ] && python -m pipx list 2>/dev/null | grep -q "$DIST_NAME"; then
+      python -m pipx uninstall "$DIST_NAME"
+      if [ -e "$HOME/.local/bin/$CONSOLE_SCRIPT" ]; then
+        echo "::error::pipx console script $CONSOLE_SCRIPT still on PATH after pipx uninstall."
+        exit 1
+      fi
+      echo "pipx uninstall verified clean."
+    fi
+    # Tripwire: only reached after every build/install/launch/upgrade/uninstall
+    # assertion above passed (set -e would have aborted otherwise). Marks that a
+    # REAL lifecycle ran on this OS, so an all-skip leg is caught downstream.
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall and verify full removal (Windows)
+  if: matrix.type == 'python-pip-wheel' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    & "$env:USERPROFILE\venv-user\Scripts\Activate.ps1"
+    python -m pip uninstall -y $env:DIST_NAME
+    # Negative assertion 1: metadata gone.
+    python -m pip show $env:DIST_NAME 2>$null
+    if ($LASTEXITCODE -eq 0) { throw "pip still reports $env:DIST_NAME installed after uninstall." }
+    # Negative assertion 2: import now fails.
+    python -c "import importlib; importlib.import_module('$env:IMPORT_NAME')" 2>$null
+    if ($LASTEXITCODE -eq 0) { throw "Module $env:IMPORT_NAME still importable after uninstall." }
+    # Negative assertion 3: console script gone from venv Scripts dir.
+    if (-not [string]::IsNullOrEmpty($env:CONSOLE_SCRIPT)) {
+      $exe = "$env:USERPROFILE\venv-user\Scripts\$($env:CONSOLE_SCRIPT).exe"
+      if (Test-Path $exe) { throw "Console script $exe still present after uninstall." }
+    }
+    Write-Host "venv uninstall verified clean."
+    # Tear down pipx system-scope install too.
+    if (-not [string]::IsNullOrEmpty($env:CONSOLE_SCRIPT)) {
+      $list = python -m pipx list 2>$null
+      if ($list -match [regex]::Escape($env:DIST_NAME)) {
+        python -m pipx uninstall $env:DIST_NAME
+        $pipxExe = "$env:USERPROFILE\.local\bin\$($env:CONSOLE_SCRIPT).exe"
+        if (Test-Path $pipxExe) { throw "pipx console script still present after uninstall." }
+        Write-Host "pipx uninstall verified clean."
+      }
+    }
+    # Tripwire: only reached after every assertion above passed (Stop preference
+    # + explicit throws abort otherwise). Marks that a REAL lifecycle ran on this
+    # OS, so an all-skip leg is caught downstream.
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

@@ -1,0 +1,501 @@
+- name: Checkout
+  if: ${{ matrix.type == 'tauri' }}
+  uses: actions/checkout@v4
+
+- name: Setup Node (frontend build)
+  if: ${{ matrix.type == 'tauri' }}
+  uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+
+- name: Setup Rust toolchain
+  if: ${{ matrix.type == 'tauri' }}
+  uses: dtolnay/rust-toolchain@stable
+
+- name: Cache Cargo build
+  if: ${{ matrix.type == 'tauri' }}
+  uses: Swatinem/rust-cache@v2
+  with:
+    # APP_DIR/TAURI_DIR are repo-level Actions Variables (vars.*), not env.*; a bare
+    # env.TAURI_DIR would silently resolve to '' and cache the wrong workspace.
+    workspaces: ${{ vars.TAURI_DIR || 'src-tauri' }} -> target
+
+- name: Install frontend dependencies
+  if: ${{ matrix.type == 'tauri' }}
+  shell: bash
+  # NOTE: this step runs on all three OSes; on Windows `shell: bash` is Git Bash by
+  # design. Keep the body POSIX/portable (no $HOME/chmod/xvfb here) so the Windows
+  # leg does not break under MSYS path-mangling.
+  working-directory: ${{ vars.APP_DIR || '.' }}
+  run: |
+    set -euo pipefail
+    if [ -f package-lock.json ]; then
+      npm ci
+    else
+      npm install
+    fi
+
+# ---------- G2: BUILD THE ARTIFACT ----------
+- name: Build Tauri bundle
+  if: ${{ matrix.type == 'tauri' }}
+  shell: bash
+  # NOTE: runs on all three OSes; on Windows `shell: bash` is Git Bash by design.
+  working-directory: ${{ vars.APP_DIR || '.' }}
+  run: |
+    set -euo pipefail
+    # Probe the project's pinned CLI exactly once, then build with ONE command path.
+    # Chaining `npx --no-install tauri build || npx tauri build` was a false-pass risk:
+    # a real compile failure in the first build would silently trigger a second,
+    # network-fetched (unpinned) build, masking the failure / leaving stale artifacts.
+    if npx --no-install tauri --version >/dev/null 2>&1; then
+      RUN="npx --no-install tauri"
+    else
+      echo "::warning::Project-local @tauri-apps/cli not found; falling back to npx-resolved (unpinned) tauri CLI."
+      RUN="npx tauri"
+    fi
+    # Single build invocation: a non-zero exit fails the job (G1).
+    $RUN build
+
+# ---------- G2: VERIFY ARTIFACT EXISTS (before any install) ----------
+- name: Verify artifact exists (Linux)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' }}
+  shell: bash
+  working-directory: ${{ vars.APP_DIR || '.' }}
+  run: |
+    set -euo pipefail
+    BUNDLE="${TAURI_DIR}/target/release/bundle"
+    APPIMAGE=$(ls "$BUNDLE"/appimage/*.AppImage 2>/dev/null | head -n1 || true)
+    DEB=$(ls "$BUNDLE"/deb/*.deb 2>/dev/null | head -n1 || true)
+    if [ -z "$APPIMAGE" ] && [ -z "$DEB" ]; then
+      echo "::error::No Linux Tauri artifact (.AppImage/.deb) found under $BUNDLE"
+      exit 1
+    fi
+    echo "ARTIFACT_APPIMAGE=$APPIMAGE" >> "$GITHUB_ENV"
+    echo "ARTIFACT_DEB=$DEB" >> "$GITHUB_ENV"
+    echo "Found AppImage='$APPIMAGE' deb='$DEB'"
+  env:
+    TAURI_DIR: ${{ vars.TAURI_DIR || 'src-tauri' }}
+
+- name: Verify artifact exists (macOS)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  shell: bash
+  working-directory: ${{ vars.APP_DIR || '.' }}
+  run: |
+    set -euo pipefail
+    BUNDLE="${TAURI_DIR}/target/release/bundle"
+    DMG=$(ls "$BUNDLE"/dmg/*.dmg 2>/dev/null | head -n1 || true)
+    APP=$(ls -d "$BUNDLE"/macos/*.app 2>/dev/null | head -n1 || true)
+    if [ -z "$DMG" ] && [ -z "$APP" ]; then
+      echo "::error::No macOS Tauri artifact (.dmg/.app) found under $BUNDLE"
+      exit 1
+    fi
+    echo "ARTIFACT_DMG=$DMG" >> "$GITHUB_ENV"
+    echo "ARTIFACT_APP=$APP" >> "$GITHUB_ENV"
+    echo "Found dmg='$DMG' app='$APP'"
+  env:
+    TAURI_DIR: ${{ vars.TAURI_DIR || 'src-tauri' }}
+
+- name: Verify artifact exists (Windows)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  shell: pwsh
+  working-directory: ${{ vars.APP_DIR || '.' }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $tauriDir = if ($env:TAURI_DIR) { $env:TAURI_DIR } else { 'src-tauri' }
+    $bundle = "$tauriDir/target/release/bundle"
+    $exe = Get-ChildItem -Path "$bundle/nsis" -Filter *-setup.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $exe) {
+      $exe = Get-ChildItem -Path "$bundle/nsis" -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if (-not $exe) {
+      Write-Error "No Windows NSIS installer (*.exe) found under $bundle/nsis"
+      exit 1
+    }
+    "ARTIFACT_NSIS=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Found NSIS installer: $($exe.FullName)"
+  env:
+    TAURI_DIR: ${{ vars.TAURI_DIR || 'src-tauri' }}
+
+# ---------- G8: SIGNING / NOTARIZATION (WARN, do not block) ----------
+- name: Check macOS signature / notarization (warn-only)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  shell: bash
+  run: |
+    set -uo pipefail
+    APP="${ARTIFACT_APP:-}"
+    if [ -z "$APP" ]; then echo "::notice::No .app to assess; skipping signature check"; exit 0; fi
+    echo "--- codesign ---"
+    if ! codesign -dv --verbose=4 "$APP" 2>&1; then
+      echo "::warning::codesign reports app is unsigned (expected on public CI without signing secrets)"
+    fi
+    echo "--- spctl Gatekeeper assessment ---"
+    if ! spctl --assess --type execute --verbose=4 "$APP" 2>&1; then
+      echo "::warning::Gatekeeper/notarization assessment failed (expected without notarization secrets)"
+    fi
+    exit 0
+
+- name: Check Windows Authenticode signature (warn-only)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $sig = Get-AuthenticodeSignature -FilePath $env:ARTIFACT_NSIS
+    Write-Host "Authenticode status: $($sig.Status)"
+    if ($sig.Status -ne 'Valid') {
+      Write-Warning "Installer is not validly signed (Status=$($sig.Status)) - expected on public CI without code-signing secrets. SmartScreen may warn end users."
+    }
+    exit 0
+
+# ---------- INSTALL (user-scope; NSIS currentUser mode) + G5 LAUNCH ----------
+- name: Install + launch (Linux, AppImage user-scope)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    mkdir -p "$HOME/.local/bin"
+    cp "$ARTIFACT_APPIMAGE" "$HOME/.local/bin/app.AppImage"
+    chmod +x "$HOME/.local/bin/app.AppImage"
+    test -x "$HOME/.local/bin/app.AppImage" || { echo "::error::AppImage not installed/executable"; exit 1; }
+    # G5: real headless GUI launch. We must assert the REAL app process, not the
+    # xvfb-run wrapper: $! is the wrapper PID and stays alive even if the inner
+    # binary crashed (and --appimage-extract-and-run re-execs an extracted binary),
+    # which would be a false pass. Extract first so we know the inner binary name,
+    # then pgrep the extracted run path.
+    EXDIR="$HOME/.local/share/app-extract"
+    rm -rf "$EXDIR"; mkdir -p "$EXDIR"
+    ( cd "$EXDIR" && "$HOME/.local/bin/app.AppImage" --appimage-extract >/dev/null )
+    APPRUN="$EXDIR/squashfs-root/AppRun"
+    test -x "$APPRUN" || { echo "::error::AppImage extraction failed; AppRun not found"; exit 1; }
+    xvfb-run -a "$APPRUN" &
+    sleep 8
+    # Match the extracted run path (anchored), not a bare basename.
+    if ! pgrep -f "$EXDIR/squashfs-root" >/dev/null; then
+      echo "::error::Tauri app exited/crashed within 8s of launch (no process under $EXDIR/squashfs-root)"
+      exit 1
+    fi
+    echo "App running under $EXDIR/squashfs-root; smoke-launch OK"
+    pkill -f "$EXDIR/squashfs-root" 2>/dev/null || true
+
+# Deb-only build must NOT skip the whole lifecycle green: install/launch/uninstall the .deb.
+- name: Install + launch (Linux, .deb system-scope)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB != '' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get install -y "$ARTIFACT_DEB"
+    # Locate the installed executable owned by the .deb (do not trust a hardcoded name).
+    PKG="$(dpkg-deb -f "$ARTIFACT_DEB" Package)"
+    BIN="$(dpkg -L "$PKG" | grep -E '/usr/bin/|/usr/local/bin/' | head -n1 || true)"
+    if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+      echo "::error::No executable installed by .deb package '$PKG'"
+      dpkg -L "$PKG" || true
+      exit 1
+    fi
+    echo "DEB_PKG=$PKG" >> "$GITHUB_ENV"
+    echo "DEB_BIN=$BIN" >> "$GITHUB_ENV"
+    # G5: real headless GUI launch; assert the installed binary path (anchored) is alive.
+    xvfb-run -a "$BIN" &
+    sleep 8
+    if ! pgrep -f "$BIN" >/dev/null; then
+      echo "::error::Tauri app ('$BIN') exited/crashed within 8s of launch"
+      exit 1
+    fi
+    echo "App '$BIN' running; smoke-launch OK"
+    pkill -f "$BIN" 2>/dev/null || true
+
+# Loud failure: an artifact existed but no Linux install path consumed it.
+- name: Fail if no Linux lifecycle path ran
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB == '' }}
+  shell: bash
+  run: |
+    echo "::error::Linux artifact present at verify but neither AppImage nor .deb install path ran; refusing to pass green."
+    exit 1
+
+- name: Install + launch (macOS, .app user-scope)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    DEST="$HOME/Applications"
+    mkdir -p "$DEST"
+    if [ -n "${ARTIFACT_DMG:-}" ]; then
+      MNT=$(mktemp -d)
+      hdiutil attach "$ARTIFACT_DMG" -nobrowse -mountpoint "$MNT" || exit 1
+      SRC_APP=$(ls -d "$MNT"/*.app | head -n1)
+      cp -R "$SRC_APP" "$DEST/"
+      hdiutil detach "$MNT" || true
+    else
+      cp -R "$ARTIFACT_APP" "$DEST/"
+    fi
+    APP_PATH=$(ls -d "$DEST"/*.app | head -n1)
+    test -d "$APP_PATH" || { echo "::error::.app not installed"; exit 1; }
+    echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+    # G5: real GUI launch via open, assert process appears, then quit.
+    BIN=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")
+    EXEC_PATH="$APP_PATH/Contents/MacOS/$BIN"
+    echo "APP_EXEC=$EXEC_PATH" >> "$GITHUB_ENV"
+    open "$APP_PATH"
+    sleep 8
+    # Anchor pgrep/pkill to the FULL installed executable path. A bare basename
+    # ("$BIN") can substring-match an unrelated process on the shared runner = false pass.
+    if ! pgrep -f "$EXEC_PATH" >/dev/null; then
+      echo "::error::Tauri app process not running after launch ($EXEC_PATH)"
+      exit 1
+    fi
+    echo "App '$EXEC_PATH' running; smoke-launch OK"
+    pkill -f "$EXEC_PATH" 2>/dev/null || true
+
+- name: Install + launch (Windows, NSIS currentUser)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  shell: pwsh
+  env:
+    # Product/install-dir match is derived from a documented var, not hardcoded.
+    # Defaults to the literal type name so a generic Tauri repo still has a sane match.
+    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || 'tauri' }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # G1: silent install, wait, assert exit code 0.
+    $p = Start-Process -FilePath $env:ARTIFACT_NSIS -ArgumentList '/S' -Wait -PassThru
+    if ($p.ExitCode -ne 0) { Write-Error "NSIS installer exited with $($p.ExitCode)"; exit 1 }
+    # NSIS currentUser installs under %LOCALAPPDATA%\<ProductName>. Locate installed exe
+    # by matching the derived product name (no hardcoded 'CivicCast').
+    $match = [regex]::Escape($env:PRODUCT_MATCH)
+    $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+      Where-Object { $_.FullName -notmatch 'uninstall' -and $_.DirectoryName -match $match } |
+      Select-Object -First 1
+    if (-not $exe) {
+      Write-Error "Installed application exe not found under $env:LOCALAPPDATA (product match: '$($env:PRODUCT_MATCH)'). Set vars.TAURI_PRODUCT_NAME to the NSIS productName."
+      exit 1
+    }
+    "INSTALLED_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    "INSTALL_DIR=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Installed exe: $($exe.FullName)"
+    # G5: real GUI launch, assert it stays alive, then stop.
+    $app = Start-Process -FilePath $exe.FullName -PassThru
+    Start-Sleep -Seconds 8
+    $live = Get-Process -Id $app.Id -ErrorAction SilentlyContinue
+    if (-not $live -or $app.HasExited) {
+      Write-Error "Tauri app exited/crashed within 8s of launch"
+      exit 1
+    }
+    Write-Host "App alive (pid $($app.Id)); smoke-launch OK"
+    Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+
+# ---------- G6: REAL UPGRADE (install prior release first, then upgrade) ----------
+- name: Upgrade over previous release (Windows)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || 'tauri' }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # Distinguish "no releases exist yet" (legit skip) from "download failed" (must FAIL).
+    $tag = (gh release list --repo $env:GITHUB_REPOSITORY --limit 1 --json tagName --jq '.[0].tagName' 2>$null)
+    if (-not $tag) {
+      Write-Host "::notice::No published release found; SKIPPED upgrade test (clean-machine install is not an upgrade)."
+      exit 0
+    }
+    Write-Host "Previous release tag: $tag"
+    $tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'prev')
+    # Releases exist: a download failure here is a REAL error (do not swallow it).
+    gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern "*-setup.exe" --dir $tmp.FullName --clobber
+    if ($LASTEXITCODE -ne 0) { Write-Error "Failed to download prior-release NSIS asset for $tag"; exit 1 }
+    $prev = Get-ChildItem -Path $tmp.FullName -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $prev) {
+      Write-Host "::notice::Release $tag has no *-setup.exe asset; SKIPPED upgrade test."
+      exit 0
+    }
+    $p1 = Start-Process -FilePath $prev.FullName -ArgumentList '/S' -Wait -PassThru
+    if ($p1.ExitCode -ne 0) { Write-Error "Prior-version install failed ($($p1.ExitCode))"; exit 1 }
+    Write-Host "Prior version installed (dirty state created): $($prev.Name)"
+    # Now upgrade with freshly built installer.
+    $p2 = Start-Process -FilePath $env:ARTIFACT_NSIS -ArgumentList '/S' -Wait -PassThru
+    if ($p2.ExitCode -ne 0) { Write-Error "Upgrade install failed ($($p2.ExitCode))"; exit 1 }
+    $match = [regex]::Escape($env:PRODUCT_MATCH)
+    $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+      Where-Object { $_.FullName -notmatch 'uninstall' -and $_.DirectoryName -match $match } |
+      Select-Object -First 1
+    if (-not $exe) { Write-Error "App missing after upgrade"; exit 1 }
+    $app = Start-Process -FilePath $exe.FullName -PassThru
+    Start-Sleep -Seconds 8
+    if ($app.HasExited) { Write-Error "Upgraded app crashed on launch"; exit 1 }
+    Write-Host "Upgrade verified; app launches."
+    Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+
+- name: Upgrade over previous release (Linux AppImage)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' }}
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -uo pipefail
+    # Distinguish "no releases" (legit skip) from "download failed" (must FAIL).
+    PREV_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+    if [ -z "${PREV_TAG:-}" ] || [ "${PREV_TAG}" = "null" ]; then
+      echo "::notice::No published release found; SKIPPED upgrade test."
+      exit 0
+    fi
+    echo "Previous release tag: $PREV_TAG"
+    set -e
+    TMP="$(mktemp -d)"
+    # Releases exist: a download failure here is a REAL error (do not swallow it).
+    gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.AppImage" --dir "$TMP" --clobber
+    PREV=$(ls "$TMP"/*.AppImage 2>/dev/null | head -n1 || true)
+    if [ -z "$PREV" ]; then
+      echo "::notice::Release $PREV_TAG has no .AppImage asset; SKIPPED upgrade test."
+      exit 0
+    fi
+    mkdir -p "$HOME/.local/bin"
+    cp "$PREV" "$HOME/.local/bin/app.AppImage"
+    chmod +x "$HOME/.local/bin/app.AppImage"
+    echo "Prior version installed (dirty state): $(basename "$PREV")"
+    # Upgrade = overwrite with freshly built artifact.
+    cp "$ARTIFACT_APPIMAGE" "$HOME/.local/bin/app.AppImage"
+    chmod +x "$HOME/.local/bin/app.AppImage"
+    # Launch the real app, not the xvfb-run wrapper: extract then pgrep the run path.
+    EXDIR="$HOME/.local/share/app-extract-upg"
+    rm -rf "$EXDIR"; mkdir -p "$EXDIR"
+    ( cd "$EXDIR" && "$HOME/.local/bin/app.AppImage" --appimage-extract >/dev/null )
+    APPRUN="$EXDIR/squashfs-root/AppRun"
+    test -x "$APPRUN" || { echo "::error::Upgraded AppImage extraction failed"; exit 1; }
+    xvfb-run -a "$APPRUN" &
+    sleep 8
+    pgrep -f "$EXDIR/squashfs-root" >/dev/null || { echo "::error::Upgraded app crashed on launch"; exit 1; }
+    echo "Upgrade verified; app launches."
+    pkill -f "$EXDIR/squashfs-root" 2>/dev/null || true
+
+- name: Upgrade over previous release (macOS)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -uo pipefail
+    # Distinguish "no releases" (legit skip) from "download failed" (must FAIL).
+    PREV_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+    if [ -z "${PREV_TAG:-}" ] || [ "${PREV_TAG}" = "null" ]; then
+      echo "::notice::No published release found; SKIPPED upgrade test."
+      exit 0
+    fi
+    echo "Previous release tag: $PREV_TAG"
+    set -e
+    TMP="$(mktemp -d)"
+    # Releases exist: a download failure here is a REAL error (do not swallow it).
+    gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.dmg" --dir "$TMP" --clobber
+    PREV=$(ls "$TMP"/*.dmg 2>/dev/null | head -n1 || true)
+    if [ -z "$PREV" ]; then
+      echo "::notice::Release $PREV_TAG has no .dmg asset; SKIPPED upgrade test."
+      exit 0
+    fi
+    DEST="$HOME/Applications"; mkdir -p "$DEST"
+    MNT=$(mktemp -d)
+    hdiutil attach "$PREV" -nobrowse -mountpoint "$MNT"
+    cp -R "$(ls -d "$MNT"/*.app | head -n1)" "$DEST/"
+    hdiutil detach "$MNT" || true
+    echo "Prior version installed (dirty state): $(basename "$PREV")"
+    # Upgrade = overwrite .app from freshly built artifact.
+    if [ -n "${ARTIFACT_DMG:-}" ]; then
+      MNT2=$(mktemp -d); hdiutil attach "$ARTIFACT_DMG" -nobrowse -mountpoint "$MNT2"
+      cp -R "$(ls -d "$MNT2"/*.app | head -n1)" "$DEST/"; hdiutil detach "$MNT2" || true
+    else
+      cp -R "$ARTIFACT_APP" "$DEST/"
+    fi
+    APP_PATH=$(ls -d "$DEST"/*.app | head -n1)
+    BIN=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist")
+    EXEC_PATH="$APP_PATH/Contents/MacOS/$BIN"
+    # G8 stays warn-only: a DOWNLOADED prior-release asset carries com.apple.quarantine,
+    # so an unsigned/un-notarized prior release would be blocked by Gatekeeper on `open`
+    # and turn G6 RED. Strip quarantine before launching so signing remains warn-only.
+    xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null || true
+    open "$APP_PATH"; sleep 8
+    # Anchor to the full executable path, not a bare basename.
+    pgrep -f "$EXEC_PATH" >/dev/null || { echo "::error::Upgraded app not running ($EXEC_PATH)"; exit 1; }
+    echo "Upgrade verified; app launches."
+    pkill -f "$EXEC_PATH" 2>/dev/null || true
+
+# ---------- G7: UNINSTALL + negative removal assertion ----------
+- name: Uninstall + verify removal (Windows)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  shell: pwsh
+  env:
+    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || 'tauri' }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $match = [regex]::Escape($env:PRODUCT_MATCH)
+    $dir = $env:INSTALL_DIR
+    $uninst = Get-ChildItem -Path $dir -Filter 'uninstall*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $uninst) {
+      $uninst = Get-ChildItem -Path $env:LOCALAPPDATA -Recurse -Filter 'uninstall*.exe' -ErrorAction SilentlyContinue |
+        Where-Object { $_.DirectoryName -match $match } | Select-Object -First 1
+    }
+    if (-not $uninst) { Write-Error "Uninstaller not found; cannot verify removal"; exit 1 }
+    $p = Start-Process -FilePath $uninst.FullName -ArgumentList '/S' -Wait -PassThru
+    if ($p.ExitCode -ne 0) { Write-Error "Uninstaller exited with $($p.ExitCode)"; exit 1 }
+    Start-Sleep -Seconds 5
+    # G7: negative assertion - installed exe AND install directory must be gone.
+    if (Test-Path $env:INSTALLED_EXE) {
+      Write-Error "Uninstall incomplete: $($env:INSTALLED_EXE) still present"
+      exit 1
+    }
+    $remaining = if ($env:INSTALL_DIR -and (Test-Path $env:INSTALL_DIR)) { (Get-ChildItem -Path $env:INSTALL_DIR -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count } else { 0 }
+    if ($remaining -gt 0) {
+      Write-Error "Uninstall incomplete: $remaining file(s) remain under $($env:INSTALL_DIR)"
+      exit 1
+    }
+    Write-Host "Uninstall verified: application files removed."
+    # Tripwire: a successful Windows lifecycle reached its end.
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+- name: Uninstall + verify removal (Linux AppImage)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    rm -f "$HOME/.local/bin/app.AppImage"
+    rm -rf "$HOME/.local/share/app-extract" "$HOME/.local/share/app-extract-upg"
+    # G7: negative assertion - file must be gone.
+    if [ -e "$HOME/.local/bin/app.AppImage" ]; then
+      echo "::error::Uninstall incomplete: AppImage still present"
+      exit 1
+    fi
+    echo "Uninstall verified: AppImage removed."
+    # Tripwire: a successful Linux (AppImage) lifecycle reached its end.
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify removal (Linux deb)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB != '' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    PKG="${DEB_PKG:-}"
+    if [ -z "$PKG" ]; then echo "::error::DEB_PKG not recorded; cannot uninstall"; exit 1; fi
+    sudo apt-get purge -y "$PKG"
+    # G7: negative assertion - package must no longer be installed and binary gone.
+    if dpkg-query -W -f='${Status}\n' "$PKG" 2>/dev/null | grep -q "install ok installed"; then
+      echo "::error::Uninstall incomplete: package '$PKG' still installed"
+      exit 1
+    fi
+    if [ -n "${DEB_BIN:-}" ] && [ -e "$DEB_BIN" ]; then
+      echo "::error::Uninstall incomplete: $DEB_BIN still present"
+      exit 1
+    fi
+    echo "Uninstall verified: .deb package removed."
+    # Tripwire: a successful Linux (.deb) lifecycle reached its end.
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify removal (macOS)
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    APP_PATH="${APP_PATH:-}"
+    if [ -z "$APP_PATH" ]; then APP_PATH=$(ls -d "$HOME/Applications"/*.app 2>/dev/null | head -n1 || true); fi
+    rm -rf "$APP_PATH"
+    # G7: negative assertion - .app must be gone.
+    if [ -d "$APP_PATH" ]; then
+      echo "::error::Uninstall incomplete: $APP_PATH still present"
+      exit 1
+    fi
+    echo "Uninstall verified: .app removed."
+    # Tripwire: a successful macOS lifecycle reached its end.
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"

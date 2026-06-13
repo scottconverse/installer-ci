@@ -1,0 +1,380 @@
+# ============================================================================
+# cargo-binary installer recipe — paste under a job's `steps:`
+# Assumes a matrix with `type` and the job running across the 3-OS matrix:
+#   strategy:
+#     matrix:
+#       type: [cargo-binary, ...]
+#       os: [ubuntu-latest, windows-latest, macos-latest]
+#   runs-on: ${{ matrix.os }}
+# Env knobs (override per repo):
+#   CARGO_BIN_NAME : the installed binary name (defaults below to repo name)
+# Every step is gated on matrix.type == 'cargo-binary'. CLI tool => --version
+# is a valid smoke (G5 GUI-launch N/A, documented in guards).
+# ============================================================================
+
+- name: Checkout
+  if: ${{ matrix.type == 'cargo-binary' }}
+  uses: actions/checkout@v4
+
+- name: Set up Rust toolchain
+  if: ${{ matrix.type == 'cargo-binary' }}
+  uses: dtolnay/rust-toolchain@stable
+
+- name: Cache cargo build
+  if: ${{ matrix.type == 'cargo-binary' }}
+  uses: Swatinem/rust-cache@v2
+
+# --- Resolve binary name from Cargo metadata (one source of truth) ----------
+- name: Resolve binary name (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    NAME="${CARGO_BIN_NAME:-}"
+    if [ -z "$NAME" ]; then
+      # First [[bin]] name, else package name. Requires jq (preinstalled on hosted runners).
+      NAME="$(cargo metadata --no-deps --format-version 1 \
+        | jq -r '.packages[0] as $p | ($p.targets[] | select(.kind[]=="bin") | .name) // $p.name' \
+        | head -n1)"
+    fi
+    if [ -z "$NAME" ] || [ "$NAME" = "null" ]; then
+      echo "::error::Could not resolve cargo binary name"; exit 1
+    fi
+    echo "BIN_NAME=$NAME" >> "$GITHUB_ENV"
+    echo "Resolved binary name: $NAME"
+
+- name: Resolve binary name (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $name = $env:CARGO_BIN_NAME
+    if ([string]::IsNullOrWhiteSpace($name)) {
+      $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+      $pkg = $meta.packages[0]
+      $bin = ($pkg.targets | Where-Object { $_.kind -contains 'bin' } | Select-Object -First 1)
+      $name = if ($bin) { $bin.name } else { $pkg.name }
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) { Write-Error "Could not resolve cargo binary name"; exit 1 }
+    "BIN_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Resolved binary name: $name"
+
+# --- G2: BUILD the artifact in-job (never assume a prebuilt binary) ---------
+- name: Build release binary
+  if: ${{ matrix.type == 'cargo-binary' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    # --locked guards against Cargo.lock drift; build fails the job on any error (G1).
+    cargo build --release --locked
+
+# --- G2: verify the artifact EXISTS before install --------------------------
+- name: Verify built artifact exists (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    ART="target/release/${BIN_NAME}"
+    if [ ! -f "$ART" ]; then
+      echo "::error::Expected build artifact not found: $ART"; ls -la target/release || true; exit 1
+    fi
+    echo "Artifact present: $ART"
+    file "$ART" || true
+
+- name: Verify built artifact exists (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $art = "target/release/$($env:BIN_NAME).exe"
+    if (-not (Test-Path -LiteralPath $art)) {
+      Write-Error "Expected build artifact not found: $art"
+      Get-ChildItem target/release -ErrorAction SilentlyContinue
+      exit 1
+    }
+    Write-Host "Artifact present: $art"
+
+# --- G8: signing posture (WARN-only; cargo binaries are unsigned) -----------
+- name: Signing posture check (macOS, WARN-only)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'macOS' }}
+  continue-on-error: true
+  shell: bash
+  run: |
+    set -uo pipefail
+    ART="target/release/${BIN_NAME}"
+    echo "::group::codesign / spctl"
+    if codesign -dv --verbose=4 "$ART" 2>&1; then
+      echo "Binary carries a code signature."
+    else
+      echo "::warning::Binary is not code-signed (expected for cargo binaries on public CI without Developer ID)."
+    fi
+    spctl --assess --type execute --verbose "$ART" 2>&1 || \
+      echo "::warning::spctl assessment rejected/unsigned binary (no notarization). Non-blocking."
+    echo "::endgroup::"
+
+- name: Signing posture check (Windows, WARN-only)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  continue-on-error: true
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Continue'
+    $art = "target/release/$($env:BIN_NAME).exe"
+    $sig = Get-AuthenticodeSignature -LiteralPath $art
+    Write-Host "Authenticode status: $($sig.Status)"
+    if ($sig.Status -ne 'Valid') {
+      Write-Host "::warning::Binary is not Authenticode-signed (Status=$($sig.Status)). Expected for cargo binaries on public CI; non-blocking."
+    }
+
+# --- INSTALL: user scope (real user prefix on PATH) -------------------------
+- name: Install (user scope) (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    USER_ROOT="$HOME/.cargo-user"
+    # cargo install runs directly: a crashed/failed install turns the job red (G1).
+    cargo install --path . --root "$USER_ROOT" --force --locked
+    INSTALLED="$USER_ROOT/bin/${BIN_NAME}"
+    if [ ! -x "$INSTALLED" ]; then
+      echo "::error::User-scope install did not produce $INSTALLED"; exit 1
+    fi
+    echo "USER_ROOT=$USER_ROOT" >> "$GITHUB_ENV"
+    echo "$USER_ROOT/bin" >> "$GITHUB_PATH"
+    echo "Installed (user scope): $INSTALLED"
+
+- name: Install (user scope) (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $userRoot = Join-Path $env:USERPROFILE '.cargo-user'
+    cargo install --path . --root $userRoot --force --locked
+    if ($LASTEXITCODE -ne 0) { Write-Error "cargo install (user) failed with exit $LASTEXITCODE"; exit 1 }
+    $installed = Join-Path $userRoot "bin/$($env:BIN_NAME).exe"
+    if (-not (Test-Path -LiteralPath $installed)) { Write-Error "User-scope install did not produce $installed"; exit 1 }
+    "USER_ROOT=$userRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Join-Path $userRoot 'bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+    Write-Host "Installed (user scope): $installed"
+
+# --- INSTALL: system scope (shared prefix; the real user-vs-system axis) -----
+# For cargo binaries the user/system distinction is the install PREFIX, not a
+# package DB. System scope = a root-owned shared prefix (/usr/local). Windows
+# has no canonical system cargo prefix, so system-scope is Linux/macOS only.
+- name: Install (system scope) (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    SYS_ROOT="/usr/local"
+    # --root must be writable by the install; use sudo for the shared prefix.
+    sudo env "PATH=$PATH" "HOME=$HOME" "$(command -v cargo)" install --path . --root "$SYS_ROOT" --force --locked
+    INSTALLED="$SYS_ROOT/bin/${BIN_NAME}"
+    if [ ! -x "$INSTALLED" ]; then
+      echo "::error::System-scope install did not produce $INSTALLED"; exit 1
+    fi
+    echo "SYS_ROOT=$SYS_ROOT" >> "$GITHUB_ENV"
+    echo "Installed (system scope): $INSTALLED"
+
+# --- G5: REAL launch/smoke of the INSTALLED binary (CLI tool) ---------------
+- name: Smoke-launch installed binary (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    BIN="$USER_ROOT/bin/${BIN_NAME}"
+    echo "Launching installed binary: $BIN"
+    # Capture output without letting set -e short-circuit the explicit RC check.
+    OUT=""; RC=0
+    OUT="$("$BIN" --version)" || RC=$?
+    if [ "$RC" -ne 0 ]; then echo "::error::--version exited $RC"; exit 1; fi
+    if [ -z "$OUT" ]; then echo "::error::--version produced empty output"; exit 1; fi
+    echo "version output: $OUT"
+    # --help is a second real invocation guarding against a stub that only knows --version.
+    "$BIN" --help >/dev/null
+    echo "Smoke launch OK"
+
+- name: Smoke-launch installed binary (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $bin = Join-Path $env:USER_ROOT "bin/$($env:BIN_NAME).exe"
+    Write-Host "Launching installed binary: $bin"
+    $proc = Start-Process -FilePath $bin -ArgumentList '--version' -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$env:RUNNER_TEMP\ver.txt"
+    if ($proc.ExitCode -ne 0) { Write-Error "--version exited $($proc.ExitCode)"; exit 1 }
+    $out = Get-Content "$env:RUNNER_TEMP\ver.txt" -Raw
+    if ([string]::IsNullOrWhiteSpace($out)) { Write-Error "--version produced empty output"; exit 1 }
+    Write-Host "version output: $out"
+    $h = Start-Process -FilePath $bin -ArgumentList '--help' -Wait -PassThru -NoNewWindow
+    if ($h.ExitCode -ne 0) { Write-Error "--help exited $($h.ExitCode)"; exit 1 }
+    Write-Host "Smoke launch OK"
+
+# --- G6: REAL upgrade — install an actual PRIOR version first, then upgrade --
+- name: Upgrade over previous release (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -euo pipefail
+    UP_ROOT="$HOME/.cargo-upgrade"
+    mkdir -p "$UP_ROOT/bin"
+    PREV_OK=0
+    # Try latest published GitHub release asset (real prior version => dirty state).
+    # Only swallow the "no releases exist" case; any OTHER gh failure must surface.
+    TAG=""
+    if TAG="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName -q .tagName 2>/tmp/gh_view.err)"; then
+      :
+    else
+      if grep -qiE 'release not found|no releases|not found' /tmp/gh_view.err; then
+        TAG=""   # legitimately no releases yet
+      else
+        echo "::error::gh release view failed (not a 'no releases' condition):"; cat /tmp/gh_view.err; exit 1
+      fi
+    fi
+    if [ -n "${TAG:-}" ]; then
+      OS="$(uname -s | tr '[:upper:]' '[:lower:]')"   # darwin|linux
+      ARCH="$(uname -m)"                               # x86_64|arm64
+      # A release EXISTS: a failed download is a HARD error (do NOT silently skip).
+      # Best-effort asset match; adjust the pattern to the repo's naming.
+      if ! gh release download "$TAG" --repo "${GITHUB_REPOSITORY}" \
+           --pattern "*${OS}*${ARCH}*" --dir "$UP_ROOT/dl"; then
+        echo "::error::Failed to download prior release asset for tag $TAG (release exists; download must succeed)."; exit 1
+      fi
+      FOUND="$(find "$UP_ROOT/dl" -type f -name "*${BIN_NAME}*" | head -n1 || true)"
+      if [ -z "$FOUND" ]; then
+        echo "::error::Prior release $TAG downloaded but no asset matched *${BIN_NAME}* in $UP_ROOT/dl"; ls -la "$UP_ROOT/dl" || true; exit 1
+      fi
+      # Asset URL form (for reference): https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/<asset>
+      if file "$FOUND" | grep -qiE 'archive|gzip|tar|zip'; then
+        tar -xf "$FOUND" -C "$UP_ROOT/dl" || unzip -o "$FOUND" -d "$UP_ROOT/dl"
+        FOUND="$(find "$UP_ROOT/dl" -type f -name "${BIN_NAME}" | head -n1 || echo "$FOUND")"
+      fi
+      install -m 0755 "$FOUND" "$UP_ROOT/bin/${BIN_NAME}"
+      PREV_OK=1
+    fi
+    # Fallback: a published crates.io version, if any (also a REAL prior version).
+    if [ "$PREV_OK" -eq 0 ]; then
+      if cargo install "${BIN_NAME}" --root "$UP_ROOT" --force; then PREV_OK=1; fi
+    fi
+    if [ "$PREV_OK" -eq 0 ]; then
+      echo "::notice::SKIPPED upgrade test — no prior GitHub release or crates.io version found (clean-machine install is NOT an upgrade)."
+      exit 0
+    fi
+    OLD_VER="$("$UP_ROOT/bin/${BIN_NAME}" --version || echo 'unknown')"
+    echo "Previous version installed (dirty state): $OLD_VER"
+    # Now upgrade IN PLACE with the freshly built current version.
+    cargo install --path . --root "$UP_ROOT" --force --locked
+    NEW_VER="$("$UP_ROOT/bin/${BIN_NAME}" --version)"
+    echo "Upgraded version: $NEW_VER"
+    if [ -z "$NEW_VER" ]; then echo "::error::Post-upgrade binary failed to report version"; exit 1; fi
+    "$UP_ROOT/bin/${BIN_NAME}" --help >/dev/null
+    echo "Upgrade over prior version OK ($OLD_VER -> $NEW_VER)"
+
+- name: Upgrade over previous release (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $upRoot = Join-Path $env:USERPROFILE '.cargo-upgrade'
+    New-Item -ItemType Directory -Force -Path (Join-Path $upRoot 'bin') | Out-Null
+    $prevOk = $false
+    # Only swallow the "no releases exist" case; any OTHER gh failure must surface.
+    $viewErr = & gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q .tagName 2>&1
+    $tag = $null
+    if ($LASTEXITCODE -eq 0) {
+      $tag = ($viewErr | Select-Object -First 1)
+    } elseif ("$viewErr" -imatch 'release not found|no releases|not found') {
+      $tag = $null   # legitimately no releases yet
+    } else {
+      Write-Error "gh release view failed (not a 'no releases' condition): $viewErr"; exit 1
+    }
+    if (-not [string]::IsNullOrWhiteSpace($tag)) {
+      $dl = Join-Path $upRoot 'dl'
+      New-Item -ItemType Directory -Force -Path $dl | Out-Null
+      # A release EXISTS: a failed download is a HARD error (do NOT silently skip).
+      gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern "*windows*" --dir $dl
+      if ($LASTEXITCODE -ne 0) { Write-Error "Failed to download prior release asset for tag $tag (release exists; download must succeed)."; exit 1 }
+      $zip = Get-ChildItem $dl -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($zip) { Expand-Archive -Path $zip.FullName -DestinationPath $dl -Force }
+      $found = Get-ChildItem $dl -Recurse -Filter "$($env:BIN_NAME).exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $found) { Write-Error "Prior release $tag downloaded but no $($env:BIN_NAME).exe asset found in $dl"; Get-ChildItem $dl -Recurse -ErrorAction SilentlyContinue; exit 1 }
+      Copy-Item $found.FullName (Join-Path $upRoot "bin/$($env:BIN_NAME).exe") -Force
+      $prevOk = $true
+    }
+    if (-not $prevOk) {
+      # Fallback: a published crates.io version, if any (also a REAL prior version).
+      cargo install $env:BIN_NAME --root $upRoot --force
+      if ($LASTEXITCODE -eq 0) { $prevOk = $true }
+    }
+    if (-not $prevOk) {
+      Write-Host "::notice::SKIPPED upgrade test — no prior GitHub release or crates.io version found (clean install is NOT an upgrade)."
+      exit 0
+    }
+    $oldBin = Join-Path $upRoot "bin/$($env:BIN_NAME).exe"
+    $old = (Start-Process -FilePath $oldBin -ArgumentList '--version' -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$env:RUNNER_TEMP\oldver.txt")
+    Write-Host "Previous version installed (dirty state). exit=$($old.ExitCode)"
+    cargo install --path . --root $upRoot --force --locked
+    if ($LASTEXITCODE -ne 0) { Write-Error "Upgrade install failed exit $LASTEXITCODE"; exit 1 }
+    $new = Start-Process -FilePath $oldBin -ArgumentList '--version' -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$env:RUNNER_TEMP\newver.txt"
+    if ($new.ExitCode -ne 0) { Write-Error "Post-upgrade --version exited $($new.ExitCode)"; exit 1 }
+    $newVer = Get-Content "$env:RUNNER_TEMP\newver.txt" -Raw
+    if ([string]::IsNullOrWhiteSpace($newVer)) { Write-Error "Post-upgrade binary failed to report version"; exit 1 }
+    Write-Host "Upgrade over prior version OK -> $newVer"
+
+# --- G7: REAL uninstall + negative assertion that files are GONE ------------
+- name: Uninstall and verify removal (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    # User scope
+    cargo uninstall --root "$USER_ROOT" "${BIN_NAME}"
+    if [ -e "$USER_ROOT/bin/${BIN_NAME}" ]; then
+      echo "::error::User-scope binary still present after uninstall"; exit 1
+    fi
+    if cargo install --list --root "$USER_ROOT" | grep -q "^${BIN_NAME} "; then
+      echo "::error::Crate still tracked in user root after uninstall"; exit 1
+    fi
+    # System scope
+    sudo env "PATH=$PATH" "HOME=$HOME" "$(command -v cargo)" uninstall --root "$SYS_ROOT" "${BIN_NAME}"
+    if [ -e "$SYS_ROOT/bin/${BIN_NAME}" ]; then
+      echo "::error::System-scope binary still present after uninstall"; exit 1
+    fi
+    echo "Uninstall verified: binary fully removed from both scopes."
+
+# --- TRIPWIRE: mark a fully-successful lifecycle so an all-skip leg is caught -
+- name: Mark lifecycle OK (Linux/macOS)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os != 'Windows' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+    echo "Lifecycle complete: build -> install -> launch -> upgrade -> uninstall verified."
+
+- name: Uninstall and verify removal (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    cargo uninstall --root $env:USER_ROOT $env:BIN_NAME
+    if ($LASTEXITCODE -ne 0) { Write-Error "cargo uninstall failed exit $LASTEXITCODE"; exit 1 }
+    $bin = Join-Path $env:USER_ROOT "bin/$($env:BIN_NAME).exe"
+    if (Test-Path -LiteralPath $bin) { Write-Error "Binary still present after uninstall: $bin"; exit 1 }
+    $list = cargo install --list --root $env:USER_ROOT
+    if ($list -match "^$([regex]::Escape($env:BIN_NAME)) ") { Write-Error "Crate still tracked after uninstall"; exit 1 }
+    Write-Host "Uninstall verified: binary fully removed."
+
+# --- TRIPWIRE: mark a fully-successful lifecycle so an all-skip leg is caught -
+- name: Mark lifecycle OK (Windows)
+  if: ${{ matrix.type == 'cargo-binary' && runner.os == 'Windows' }}
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Lifecycle complete: build -> install -> launch -> upgrade -> uninstall verified."

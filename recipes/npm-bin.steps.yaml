@@ -1,0 +1,374 @@
+# =====================================================================
+# npm-bin installer slice
+# Type: an npm package that exposes one or more CLI executables via the
+# package.json "bin" field. "Installer artifact" = the publishable tarball
+# produced by `npm pack` (<name>-<version>.tgz). "Install" = global install
+# of that tarball, which symlinks the bin onto PATH. CLI tool => no GUI/
+# windowing; G5 is satisfied by a real executed-command smoke test, and G8
+# is satisfied structurally (integrity hash + provenance check + WARN),
+# since npm tarballs are not Authenticode/Gatekeeper-signed.
+# All steps gated on matrix.type == 'npm-bin'. OS-specific steps additionally
+# gated on runner.os, each in its own idiomatic single shell (G4).
+# =====================================================================
+
+# ---------- TOOLCHAIN ----------
+- name: Checkout
+  if: matrix.type == 'npm-bin'
+  uses: actions/checkout@v4
+
+- name: Setup Node.js
+  if: matrix.type == 'npm-bin'
+  uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    registry-url: 'https://registry.npmjs.org'
+
+# ---------- G2: BUILD THE ARTIFACT (do not assume a .tgz pre-exists) ----------
+# Single shell per step. `npm ci` falls back to `npm install` when there is
+# no lockfile so this works for every npm-bin repo. `npm pack` is the npm-bin
+# equivalent of "build the installer": it produces the exact tarball that
+# `npm publish` would upload.
+- name: Install dependencies and build (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+      npm ci
+    else
+      npm install
+    fi
+    # Run a build script only if one is actually defined (TS/bundlers).
+    if npm run | grep -qE '^[[:space:]]*build'; then
+      npm run build
+    fi
+
+- name: Install dependencies and build (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    if ((Test-Path package-lock.json) -or (Test-Path npm-shrinkwrap.json)) {
+      npm ci
+      if ($LASTEXITCODE -ne 0) { throw "npm ci failed ($LASTEXITCODE)" }
+    } else {
+      npm install
+      if ($LASTEXITCODE -ne 0) { throw "npm install failed ($LASTEXITCODE)" }
+    }
+    $scripts = (npm run) -join "`n"
+    if ($scripts -match '(?m)^\s*build') {
+      npm run build
+      if ($LASTEXITCODE -ne 0) { throw "npm run build failed ($LASTEXITCODE)" }
+    }
+
+# Pack the tarball. --json gives us filename + integrity in one shot so we
+# never guess the name (scoped pkgs become scope-name-version.tgz).
+- name: Pack tarball (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    PACK_JSON="$(npm pack --json)"
+    TARBALL="$(node -e 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(d[0].filename)' <<< "$PACK_JSON")"
+    echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+    echo "Packed: $TARBALL"
+
+- name: Pack tarball (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $packJson = (npm pack --json | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "npm pack failed ($LASTEXITCODE)" }
+    $tarball = ($packJson | ConvertFrom-Json)[0].filename
+    "TARBALL=$tarball" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Packed: $tarball"
+
+# ---------- G2: ASSERT ARTIFACT EXISTS before install ----------
+- name: Verify artifact exists (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    test -f "$TARBALL" || { echo "::error::Expected tarball '$TARBALL' not found"; exit 1; }
+    bytes=$(wc -c < "$TARBALL")
+    [ "$bytes" -gt 0 ] || { echo "::error::Tarball is empty"; exit 1; }
+    echo "Artifact OK: $TARBALL ($bytes bytes)"
+
+- name: Verify artifact exists (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-Path $env:TARBALL)) { throw "Expected tarball '$($env:TARBALL)' not found" }
+    if ((Get-Item $env:TARBALL).Length -le 0) { throw "Tarball is empty" }
+    Write-Host "Artifact OK: $($env:TARBALL)"
+
+# ---------- G8: STRUCTURAL SIGNING / PROVENANCE CHECK (WARN, never block) ----------
+# npm tarballs aren't Authenticode/Gatekeeper-signed; the real integrity story
+# is the package integrity hash + (optionally) npm registry provenance
+# attestations. On public CI without NPM_TOKEN we can only verify structurally,
+# so we WARN, never fail.
+- name: Integrity / provenance check (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    INTEGRITY="$(npm pack --dry-run --json "$TARBALL" 2>/dev/null | node -e 'try{const d=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(d[0].integrity||"")}catch(e){process.stdout.write("")}' || true)"
+    if [ -n "$INTEGRITY" ]; then
+      echo "Tarball integrity: $INTEGRITY"
+    else
+      echo "::warning::Could not compute tarball integrity hash (continuing)"
+    fi
+    if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+      echo "::warning::No npm publish token in CI -> npm registry provenance attestation (npm publish --provenance) cannot be verified here. Structural integrity check only."
+    fi
+
+- name: Integrity / provenance check (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $hash = (Get-FileHash $env:TARBALL -Algorithm SHA512).Hash
+    Write-Host "Tarball SHA512: $hash"
+    if (-not $env:NODE_AUTH_TOKEN) {
+      Write-Host "::warning::No npm publish token in CI -> npm registry provenance attestation cannot be verified here. Structural integrity check only."
+    }
+
+# ---------- INSTALL (system-scope vs user-scope) ----------
+# For npm-bin the real scope distinction is global vs local. We test the
+# meaningful one: GLOBAL install (`npm install -g`), which is how an end user
+# would get the CLI onto PATH. On hosted runners the npm global prefix is
+# user-writable (no sudo needed), so this is genuinely user-scope global.
+# We capture the package name from package.json (not the tarball filename).
+- name: Install globally and expose name/bins (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    PKG_NAME="$(node -p "require('./package.json').name")"
+    echo "PKG_NAME=$PKG_NAME" >> "$GITHUB_ENV"
+    # Capture declared bin names for later launch + uninstall assertions.
+    node -e 'const p=require("./package.json");let b=p.bin;if(typeof b==="string")b={[p.name.replace(/^@.*\//,"")]:b};process.stdout.write(Object.keys(b||{}).join("\n"))' > bin_names.txt
+    test -s bin_names.txt || { echo "::error::package.json declares no bin entries; not an npm-bin package"; exit 1; }
+    echo "Declared bins:"; cat bin_names.txt
+    npm install -g "./$TARBALL"
+    echo "GLOBAL_BIN=$(npm bin -g 2>/dev/null || dirname "$(command -v npm)")" >> "$GITHUB_ENV"
+
+- name: Install globally and expose name/bins (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $pkgName = (node -p "require('./package.json').name")
+    "PKG_NAME=$pkgName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    node -e 'const p=require("./package.json");let b=p.bin;if(typeof b==="string")b={[p.name.replace(/^@.*\//,"")]:b};process.stdout.write(Object.keys(b||{}).join("`n"))' | Out-File -FilePath bin_names.txt -Encoding utf8
+    if (-not (Test-Path bin_names.txt) -or ((Get-Item bin_names.txt).Length -le 0)) { throw "package.json declares no bin entries; not an npm-bin package" }
+    Write-Host "Declared bins:"; Get-Content bin_names.txt
+    npm install -g "./$($env:TARBALL)"
+    if ($LASTEXITCODE -ne 0) { throw "npm install -g failed ($LASTEXITCODE)" }
+
+# ---------- G5 (CLI-appropriate) + G1: REAL LAUNCH / SMOKE-VERIFY ----------
+# This is a CLI, not a GUI, so a real launch = actually invoking each declared
+# bin via PATH resolution and asserting exit code 0. We resolve through PATH
+# (which/Get-Command) to prove the symlink/shim was created, then EXECUTE it.
+# We try common no-op subcommands and require at least one to run with exit 0.
+- name: Launch / smoke-verify each bin (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    hash -r
+    while IFS= read -r BIN; do
+      [ -z "$BIN" ] && continue
+      RESOLVED="$(command -v "$BIN")" || { echo "::error::bin '$BIN' not found on PATH after install"; exit 1; }
+      echo "Resolved '$BIN' -> $RESOLVED"
+      ok=0
+      for args in "--version" "--help" ""; do
+        # shellcheck disable=SC2086
+        if "$BIN" $args >/dev/null 2>&1; then ok=1; echo "  launched: $BIN $args (exit 0)"; break; fi
+      done
+      [ "$ok" -eq 1 ] || { echo "::error::bin '$BIN' resolved but failed to execute (--version/--help/no-arg all non-zero)"; exit 1; }
+    done < bin_names.txt
+    echo "All bins launched successfully."
+
+- name: Launch / smoke-verify each bin (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $bins = Get-Content bin_names.txt | Where-Object { $_.Trim() -ne '' }
+    foreach ($bin in $bins) {
+      $cmd = Get-Command $bin -ErrorAction SilentlyContinue
+      if (-not $cmd) { throw "bin '$bin' not found on PATH after install" }
+      Write-Host "Resolved '$bin' -> $($cmd.Source)"
+      $ok = $false
+      foreach ($args in @('--version','--help','')) {
+        $argList = if ($args -ne '') { @($args) } else { @() }
+        $proc = Start-Process -FilePath $cmd.Source -ArgumentList $argList -NoNewWindow -Wait -PassThru `
+                  -RedirectStandardOutput $env:TEMP\nb_out.txt -RedirectStandardError $env:TEMP\nb_err.txt
+        if ($proc.ExitCode -eq 0) { $ok = $true; Write-Host "  launched: $bin $args (exit 0)"; break }
+      }
+      if (-not $ok) { throw "bin '$bin' resolved but failed to execute (--version/--help/no-arg all non-zero)" }
+    }
+    Write-Host "All bins launched successfully."
+
+# ---------- G6: REAL UPGRADE over a genuine previous release ----------
+# Create real dirty state by FIRST installing the latest published version
+# from the npm registry, then installing our freshly-built tarball over it,
+# then re-launching. Graceful skip if the package was never published.
+- name: Upgrade over previous published release (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Query the registry. Distinguish three outcomes:
+    #   - package never published (E404)  -> legitimate SKIP (visible ::notice::)
+    #   - registry/network error          -> FAIL (do not swallow + skip green)
+    #   - a prior version exists           -> run the real upgrade
+    PREV=""
+    if PREV="$(npm view "$PKG_NAME" version 2>view_err.txt)"; then
+      PREV="$(printf '%s' "$PREV" | tr -d '[:space:]')"
+    else
+      if grep -qiE 'E404|404 Not Found|is not in this registry|no such package' view_err.txt; then
+        echo "::notice::No prior published version of '$PKG_NAME' on the registry -> SKIPPED upgrade test (clean-machine install is NOT an upgrade)."
+        cat view_err.txt || true
+        exit 0
+      fi
+      echo "::error::Failed to query registry for prior version of '$PKG_NAME' (not a 404 - treating as a real failure):"
+      cat view_err.txt || true
+      exit 1
+    fi
+    if [ -z "$PREV" ]; then
+      echo "::notice::Registry returned no version for '$PKG_NAME' -> SKIPPED upgrade test (no prior release to upgrade from)."
+      exit 0
+    fi
+    echo "Previous published version: $PREV"
+    npm install -g "${PKG_NAME}@${PREV}"
+    FIRST_BIN="$(head -n1 bin_names.txt)"
+    hash -r
+    command -v "$FIRST_BIN" >/dev/null || { echo "::error::previous version did not install bin '$FIRST_BIN'"; exit 1; }
+    echo "Dirty state established with $PKG_NAME@$PREV. Upgrading with freshly built tarball..."
+    npm install -g "./$TARBALL"
+    hash -r
+    NEW_VER="$(node -p "require('./package.json').version")"
+    INSTALLED="$(npm ls -g --depth=0 "$PKG_NAME" 2>/dev/null | grep -oE "${PKG_NAME}@[0-9][^ ]*" | head -n1 || true)"
+    echo "After upgrade, global list shows: ${INSTALLED:-<none>}"
+    # Hard-assert the freshly built version is the one now installed (a no-op
+    # "upgrade" that left the old version in place must NOT pass green).
+    [ -n "$INSTALLED" ] || { echo "::error::package '$PKG_NAME' not found in global list after upgrade"; exit 1; }
+    [ "$INSTALLED" = "${PKG_NAME}@${NEW_VER}" ] || { echo "::error::after upgrade installed '$INSTALLED' but expected '${PKG_NAME}@${NEW_VER}'"; exit 1; }
+    command -v "$FIRST_BIN" >/dev/null || { echo "::error::bin '$FIRST_BIN' missing after upgrade"; exit 1; }
+    "$FIRST_BIN" --version >/dev/null 2>&1 || "$FIRST_BIN" --help >/dev/null 2>&1 || { echo "::error::bin failed to run after upgrade"; exit 1; }
+    echo "Upgrade $PREV -> $NEW_VER verified."
+
+- name: Upgrade over previous published release (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # Query the registry. Distinguish package-never-published (E404 -> legitimate
+    # SKIP) from a real registry/network failure (must FAIL, never skip green).
+    $prevErr = & npm view $env:PKG_NAME version 2>&1
+    $prevCode = $LASTEXITCODE
+    if ($prevCode -ne 0) {
+      $errText = ($prevErr | Out-String)
+      if ($errText -match '(?i)E404|404 Not Found|is not in this registry|no such package') {
+        Write-Host "::notice::No prior published version of '$($env:PKG_NAME)' on the registry -> SKIPPED upgrade test (clean-machine install is NOT an upgrade)."
+        Write-Host $errText
+        exit 0
+      }
+      Write-Host $errText
+      throw "Failed to query registry for prior version of '$($env:PKG_NAME)' (not a 404 - treating as a real failure)"
+    }
+    $prev = (($prevErr | Out-String) -replace '\s', '')
+    if (-not $prev) {
+      Write-Host "::notice::Registry returned no version for '$($env:PKG_NAME)' -> SKIPPED upgrade test (no prior release to upgrade from)."
+      exit 0
+    }
+    Write-Host "Previous published version: $prev"
+    npm install -g "$($env:PKG_NAME)@$prev"
+    if ($LASTEXITCODE -ne 0) { throw "installing previous version failed ($LASTEXITCODE)" }
+    $firstBin = (Get-Content bin_names.txt | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1)
+    if (-not (Get-Command $firstBin -ErrorAction SilentlyContinue)) { throw "previous version did not install bin '$firstBin'" }
+    Write-Host "Dirty state established with $($env:PKG_NAME)@$prev. Upgrading with freshly built tarball..."
+    npm install -g "./$($env:TARBALL)"
+    if ($LASTEXITCODE -ne 0) { throw "upgrade install failed ($LASTEXITCODE)" }
+    # Hard-assert the freshly built version is now the installed one.
+    $newVer = (node -p "require('./package.json').version")
+    $listed = (npm ls -g --depth=0 $env:PKG_NAME 2>$null | Out-String)
+    $expected = "$($env:PKG_NAME)@$newVer"
+    Write-Host "After upgrade, global list shows: $listed"
+    if ($listed -notmatch [regex]::Escape($expected)) {
+      throw "after upgrade expected '$expected' in global list but it was not found"
+    }
+    $cmd = Get-Command $firstBin -ErrorAction SilentlyContinue
+    if (-not $cmd) { throw "bin '$firstBin' missing after upgrade" }
+    $proc = Start-Process -FilePath $cmd.Source -ArgumentList '--version' -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+      $proc = Start-Process -FilePath $cmd.Source -ArgumentList '--help' -NoNewWindow -Wait -PassThru
+      if ($proc.ExitCode -ne 0) { throw "bin failed to run after upgrade" }
+    }
+    Write-Host "Upgrade from $prev to $newVer verified."
+
+# ---------- G7: REAL UNINSTALL + negative assertion ----------
+- name: Uninstall and verify full removal (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    npm uninstall -g "$PKG_NAME"
+    hash -r
+    # Negative assertion: package gone from global list AND every bin gone from PATH.
+    if npm ls -g --depth=0 "$PKG_NAME" 2>/dev/null | grep -q "${PKG_NAME}@"; then
+      echo "::error::Package '$PKG_NAME' still present in global list after uninstall"; exit 1
+    fi
+    fail=0
+    while IFS= read -r BIN; do
+      [ -z "$BIN" ] && continue
+      if command -v "$BIN" >/dev/null 2>&1; then
+        echo "::error::bin '$BIN' still resolves on PATH after uninstall ($(command -v "$BIN"))"; fail=1
+      fi
+    done < bin_names.txt
+    [ "$fail" -eq 0 ] || exit 1
+    echo "Uninstall verified: package and all bins removed."
+
+- name: Uninstall and verify full removal (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    npm uninstall -g $env:PKG_NAME
+    if ($LASTEXITCODE -ne 0) { throw "npm uninstall -g failed ($LASTEXITCODE)" }
+    $globalList = (npm ls -g --depth=0 $env:PKG_NAME 2>$null | Out-String)
+    if ($globalList -match [regex]::Escape("$($env:PKG_NAME)@")) {
+      throw "Package '$($env:PKG_NAME)' still present in global list after uninstall"
+    }
+    $fail = $false
+    $bins = Get-Content bin_names.txt | Where-Object { $_.Trim() -ne '' }
+    foreach ($bin in $bins) {
+      $cmd = Get-Command $bin -ErrorAction SilentlyContinue
+      if ($cmd) { Write-Host "::error::bin '$bin' still resolves on PATH after uninstall ($($cmd.Source))"; $fail = $true }
+    }
+    if ($fail) { throw "Uninstall incomplete: one or more bins still present" }
+    Write-Host "Uninstall verified: package and all bins removed."
+
+# ---------- TRIPWIRE: only set after a full, real lifecycle has passed ----------
+# Set as the FINAL step of a successful lifecycle (after uninstall verification),
+# so a leg that skipped every real step never sets the marker and is caught
+# downstream. Per-OS because the lifecycle is implemented per-OS above.
+- name: Mark lifecycle OK (POSIX)
+  if: matrix.type == 'npm-bin' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+    echo "npm-bin lifecycle complete (build -> install -> launch -> upgrade -> uninstall)."
+
+- name: Mark lifecycle OK (Windows)
+  if: matrix.type == 'npm-bin' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "npm-bin lifecycle complete (build -> install -> launch -> upgrade -> uninstall)."

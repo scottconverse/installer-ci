@@ -1,0 +1,228 @@
+# =====================================================================
+# docker-image installer lifecycle
+# Linux-ONLY by design: GitHub-hosted ubuntu-latest is the only runner
+# with a working Linux Docker daemon (Buildx + Compose v2 preinstalled).
+# windows-latest only runs Windows containers; macos-latest has NO docker
+# daemon (no nested virt). Faking a "structural-only" run there would be a
+# false pass, so we scope every lifecycle step to runner.os == 'Linux'.
+# Image name assumes lowercase OWNER/REPO for GHCR (ghcr.io requires lowercase).
+# =====================================================================
+
+- name: Checkout (docker-image)
+  if: matrix.type == 'docker-image'
+  uses: actions/checkout@v4
+
+- name: Set up Docker Buildx (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  uses: docker/setup-buildx-action@v3
+
+# --- Resolve a deterministic, lowercase image ref + locate the Dockerfile ---
+- name: Resolve image ref and build context (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    OWNER_REPO="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+    echo "GHCR_REPO=ghcr.io/${OWNER_REPO}" >> "$GITHUB_ENV"
+    echo "LOCAL_TAG=installer-ci:${{ github.sha }}" >> "$GITHUB_ENV"
+    # Pick the primary Dockerfile (override via env DOCKERFILE / CONTEXT_DIR if set upstream).
+    DOCKERFILE="${DOCKERFILE:-}"
+    if [ -z "$DOCKERFILE" ]; then
+      if   [ -f Dockerfile ];          then DOCKERFILE=Dockerfile;          CONTEXT_DIR=.
+      elif [ -f backend/Dockerfile ];  then DOCKERFILE=backend/Dockerfile;  CONTEXT_DIR=backend
+      else DOCKERFILE="$(find . -name Dockerfile -not -path '*/node_modules/*' | head -n1)"; CONTEXT_DIR="$(dirname "$DOCKERFILE")"; fi
+    fi
+    test -n "$DOCKERFILE" -a -f "$DOCKERFILE" || { echo "::error::No Dockerfile found"; exit 1; }
+    echo "DOCKERFILE=$DOCKERFILE"   >> "$GITHUB_ENV"
+    echo "CONTEXT_DIR=${CONTEXT_DIR:-.}" >> "$GITHUB_ENV"
+    # Expected runtime port for the smoke test (override via APP_PORT upstream).
+    echo "APP_PORT=${APP_PORT:-3000}" >> "$GITHUB_ENV"
+    echo "Using Dockerfile=$DOCKERFILE context=${CONTEXT_DIR:-.} ref=$LOCAL_TAG"
+
+# --- G2: BUILD the artifact (image tarball) in-job; never assume it pre-exists ---
+- name: Build image artifact (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    docker buildx build \
+      --file "$DOCKERFILE" \
+      --tag "$LOCAL_TAG" \
+      --provenance=true \
+      --sbom=true \
+      --output type=docker,dest="${RUNNER_TEMP}/image.tar" \
+      "$CONTEXT_DIR"
+
+# --- G2: assert the artifact EXISTS and is a non-empty, valid image tar ---
+- name: Verify image artifact exists (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    ART="${RUNNER_TEMP}/image.tar"
+    test -s "$ART" || { echo "::error::Image artifact missing or empty: $ART"; exit 1; }
+    # An OCI/docker save tar always contains a manifest.json at its root.
+    tar -tf "$ART" | grep -q 'manifest.json' || { echo "::error::Artifact is not a valid image tar"; exit 1; }
+    echo "Artifact OK: $(du -h "$ART" | cut -f1)"
+
+# --- INSTALL (system scope): load the built image into the daemon ---
+# Docker images are inherently system/daemon-scoped on Linux; there is no
+# genuine per-user image store, so user-scope is N/A for this type.
+- name: Install image into daemon (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    docker load --input "${RUNNER_TEMP}/image.tar"
+    # G7 baseline: prove it is present after install (positive assertion).
+    docker image inspect "$LOCAL_TAG" >/dev/null \
+      || { echo "::error::Image not present after docker load"; exit 1; }
+
+# --- G5: REAL LAUNCH/smoke test — run the container and prove the app works ---
+# For a server image, "launch" = run detached, then assert the container stays
+# alive AND the app actually answers on its port (not just `docker inspect`).
+- name: Launch and smoke-verify container (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    CID="$(docker run -d --rm --name ci-smoke -p ${APP_PORT}:${APP_PORT} \
+            -e NODE_ENV=production "$LOCAL_TAG")"
+    echo "CID=$CID" >> "$GITHUB_ENV"
+    cleanup() { docker logs ci-smoke 2>&amp;1 | tail -n 50 || true; }
+    trap cleanup EXIT
+    # Poll the app for up to 60s; succeed on any HTTP response (2xx/3xx/4xx all
+    # prove the server bound the port), fail if the container dies or never binds.
+    ok=0
+    for i in $(seq 1 30); do
+      if ! docker ps --filter "id=$CID" --filter status=running -q | grep -q .; then
+        echo "::error::Container exited prematurely during smoke test"; exit 1
+      fi
+      code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_PORT}/" || true)"
+      if [ -n "$code" ] &amp;&amp; [ "$code" != "000" ]; then
+        echo "App responded with HTTP $code"; ok=1; break
+      fi
+      sleep 2
+    done
+    [ "$ok" = "1" ] || { echo "::error::App never responded on port ${APP_PORT}"; exit 1; }
+    trap - EXIT
+    docker stop ci-smoke >/dev/null 2>&amp;1 || true
+
+# --- G8: signature / provenance verification (WARN-only on public CI) ---
+- name: Install cosign (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  uses: sigstore/cosign-installer@v3
+
+- name: Verify image signature/provenance (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Built locally with --provenance/--sbom; confirm provenance metadata is attached.
+    if docker buildx imagetools inspect "$LOCAL_TAG" >/dev/null 2>&amp;1; then
+      echo "Build provenance/SBOM metadata requested at build time."
+    fi
+    # Public CI has no cosign signing key. Verify keyless cosign signature against
+    # the published GHCR ref IF one exists; never hard-fail when unsigned.
+    if cosign verify "${GHCR_REPO}:latest" \
+         --certificate-identity-regexp '.*' \
+         --certificate-oidc-issuer-regexp '.*' >/dev/null 2>&amp;1; then
+      echo "::notice::Published image has a valid cosign signature."
+    else
+      echo "::warning::Image is unsigned or signature unverifiable (expected on public CI without a cosign key). Structural provenance check only."
+    fi
+
+# --- G6: REAL UPGRADE — install an actual prior release first, then upgrade ---
+# Pull the previously published GHCR tag to create genuine dirty state, run it
+# with a persistent named volume, then load+run the freshly built image over it.
+# Gracefully SKIP if no prior published image exists.
+- name: Log in to GHCR for upgrade test (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  uses: docker/login-action@v3
+  with:
+    registry: ghcr.io
+    username: ${{ github.actor }}
+    password: ${{ secrets.GITHUB_TOKEN }}
+
+- name: Upgrade over previous release (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    PREV="${GHCR_REPO}:latest"
+    # Distinguish "no prior tag exists yet" (legit skip) from a real download/auth/registry
+    # failure (must FAIL). Probe with `docker manifest inspect`, capturing stderr so we can
+    # branch on the error instead of swallowing every failure into a green skip.
+    if MANIFEST_ERR="$(docker manifest inspect "$PREV" 2>&amp;1 >/dev/null)"; then
+      : # tag exists; proceed to pull below
+    elif echo "$MANIFEST_ERR" | grep -qiE 'no such manifest|manifest unknown|not found|404'; then
+      echo "::notice::No prior published image at ${PREV}; SKIPPED upgrade test (first release)."
+      exit 0
+    else
+      echo "::error::Failed to query prior image ${PREV} (not a missing-tag condition): ${MANIFEST_ERR}"
+      exit 1
+    fi
+    # The tag genuinely exists, so a failed pull is a real error, not a skip.
+    docker pull "$PREV" >/dev/null \
+      || { echo "::error::Prior image ${PREV} exists but pull failed"; exit 1; }
+    echo "Installed prior release: $PREV"
+    # Create real prior-version state on a persistent named volume.
+    docker volume create ci-upgrade-data >/dev/null
+    docker run -d --name ci-prev -p ${APP_PORT}:${APP_PORT} \
+      -v ci-upgrade-data:/data -e NODE_ENV=production "$PREV"
+    # Confirm the OLD version actually came up before we upgrade over it.
+    up=0
+    for i in $(seq 1 30); do
+      code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_PORT}/" || true)"
+      [ -n "$code" ] &amp;&amp; [ "$code" != "000" ] &amp;&amp; { up=1; break; }; sleep 2
+    done
+    [ "$up" = "1" ] || { echo "::error::Prior release failed to start; cannot perform upgrade test"; docker logs ci-prev | tail -50; exit 1; }
+    PREV_ID="$(docker inspect --format '{{.Image}}' ci-prev)"
+    # Tear down the old container (data survives on the volume) and bring up NEW image.
+    docker rm -f ci-prev >/dev/null
+    docker run -d --name ci-new -p ${APP_PORT}:${APP_PORT} \
+      -v ci-upgrade-data:/data -e NODE_ENV=production "$LOCAL_TAG"
+    upg=0
+    for i in $(seq 1 30); do
+      if ! docker ps --filter name=ci-new --filter status=running -q | grep -q .; then
+        echo "::error::Upgraded container exited during upgrade smoke test"; docker logs ci-new | tail -50; exit 1
+      fi
+      code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_PORT}/" || true)"
+      [ -n "$code" ] &amp;&amp; [ "$code" != "000" ] &amp;&amp; { upg=1; break; }; sleep 2
+    done
+    [ "$upg" = "1" ] || { echo "::error::Upgraded image failed to serve after upgrade over prior release"; docker logs ci-new | tail -50; exit 1; }
+    NEW_ID="$(docker inspect --format '{{.Image}}' ci-new)"
+    # Assert the running image genuinely changed (true upgrade, not a no-op).
+    [ "$NEW_ID" != "$PREV_ID" ] || echo "::warning::New image digest equals prior release digest (no content change)."
+    echo "Upgrade OK: prior=$PREV_ID -> new=$NEW_ID"
+    docker rm -f ci-new >/dev/null
+
+# --- G7: REAL UNINSTALL + negative assertion that nothing remains ---
+- name: Uninstall and verify full removal (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Remove any containers from this run, the loaded image, and upgrade volume.
+    docker rm -f ci-smoke ci-prev ci-new 2>/dev/null || true
+    docker rmi -f "$LOCAL_TAG" 2>/dev/null || true
+    docker volume rm -f ci-upgrade-data 2>/dev/null || true
+    # Negative assertions: fail if anything from this run survived uninstall.
+    if docker image inspect "$LOCAL_TAG" >/dev/null 2>&amp;1; then
+      echo "::error::Image still present after uninstall: $LOCAL_TAG"; exit 1
+    fi
+    if docker ps -a --format '{{.Names}}' | grep -E '^ci-(smoke|prev|new)$'; then
+      echo "::error::Leftover containers after uninstall"; exit 1
+    fi
+    if docker volume ls --format '{{.Name}}' | grep -q '^ci-upgrade-data$'; then
+      echo "::error::Leftover volume after uninstall"; exit 1
+    fi
+    echo "Uninstall verified: image, containers, and volume fully removed."
+
+# --- TRIPWIRE: mark a successful full lifecycle so an all-skip leg is caught downstream ---
+- name: Mark lifecycle complete (docker-image)
+  if: matrix.type == 'docker-image' &amp;&amp; runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"

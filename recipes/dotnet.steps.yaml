@@ -1,0 +1,404 @@
+- name: Checkout (dotnet)
+  if: matrix.type == 'dotnet'
+  uses: actions/checkout@v4
+
+- name: Setup .NET SDK (dotnet)
+  if: matrix.type == 'dotnet'
+  uses: actions/setup-dotnet@v4
+  with:
+    # If a global.json is committed it pins the SDK; dotnet-version below is the
+    # fallback when no global.json is present. Keep both for determinism.
+    dotnet-version: '8.0.x'
+
+- name: Print SDK info (dotnet)
+  if: matrix.type == 'dotnet'
+  shell: bash
+  run: |
+    set -euo pipefail
+    dotnet --info
+    echo "DOTNET_TOOL_PKG_ID=${DOTNET_TOOL_PKG_ID:-}" >> "$GITHUB_ENV"
+
+# ---------------------------------------------------------------------------
+# G2: BUILD THE ARTIFACT. A .NET "installer" is a packed .nupkg tool package.
+# Never assume nupkg/ pre-exists. Pack it here. PackAsTool must be true in the
+# csproj (a real .NET tool); we assert the nupkg exists before any install.
+# Output dir is normalized to ./nupkg-out. We capture the package id + version
+# into env so later steps reference an exact, real package (G3 correctness).
+# ---------------------------------------------------------------------------
+- name: Build .nupkg tool package (dotnet)
+  if: matrix.type == 'dotnet'
+  shell: bash
+  run: |
+    set -euo pipefail
+    rm -rf ./nupkg-out
+    # Restore + pack in Release. dotnet exits non-zero on failure under set -e (G1).
+    dotnet restore
+    dotnet pack -c Release -o ./nupkg-out /p:PackAsTool=true
+    echo "Packed artifacts:"
+    ls -la ./nupkg-out
+
+- name: Verify artifact exists + resolve package id/version (dotnet)
+  if: matrix.type == 'dotnet'
+  shell: bash
+  run: |
+    set -euo pipefail
+    NUPKG="$(ls ./nupkg-out/*.nupkg 2>/dev/null | grep -v '\.symbols\.nupkg$' | head -n1 || true)"
+    if [ -z "${NUPKG}" ] || [ ! -f "${NUPKG}" ]; then
+      echo "::error::No .nupkg artifact produced by dotnet pack. Is <PackAsTool>true</PackAsTool> set?"
+      exit 1
+    fi
+    BASE="$(basename "${NUPKG}" .nupkg)"
+    # File name is <PackageId>.<Version>.nupkg ; split on the first dotted version segment.
+    VER="$(echo "${BASE}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$' | head -n1)"
+    PKGID="${BASE%.${VER}}"
+    if [ -z "${VER}" ] || [ -z "${PKGID}" ] || [ "${PKGID}" = "${BASE}" ]; then
+      echo "::error::Could not parse package id/version from '${BASE}'."
+      exit 1
+    fi
+    # Resolve the invokable command name from the .nuspec inside the package
+    # (the command can differ from the package id). Default to package id.
+    CMD="${PKGID}"
+    python3 - "$NUPKG" <<'PY' || true
+    import sys, zipfile, re, os
+    nupkg = sys.argv[1]
+    cmd = None
+    with zipfile.ZipFile(nupkg) as z:
+        # DotnetToolSettings.xml lists the actual command name(s).
+        for n in z.namelist():
+            if n.lower().endswith('dotnettoolsettings.xml'):
+                data = z.read(n).decode('utf-8', 'replace')
+                m = re.search(r'<Command\b[^>]*\bName="([^"]+)"', data)
+                if m:
+                    cmd = m.group(1)
+                break
+    if cmd:
+        with open(os.environ['GITHUB_ENV'], 'a') as f:
+            f.write(f"DOTNET_TOOL_CMD={cmd}\n")
+        print(f"Resolved tool command: {cmd}")
+    PY
+    echo "DOTNET_NUPKG=${NUPKG}"   >> "$GITHUB_ENV"
+    echo "DOTNET_PKG_ID=${PKGID}"  >> "$GITHUB_ENV"
+    echo "DOTNET_PKG_VER=${VER}"   >> "$GITHUB_ENV"
+    echo "DOTNET_SRC_DIR=$(cd ./nupkg-out && pwd)" >> "$GITHUB_ENV"
+    echo "Artifact OK: id=${PKGID} version=${VER} path=${NUPKG}"
+
+# ---------------------------------------------------------------------------
+# G8: SIGNING. .NET tool .nupkg packages are typically NOT Authenticode-signed;
+# NuGet author/repo signatures are optional and absent on public CI without
+# secrets. Do a structural check and WARN only (never hard-fail).
+# Split per shell (G4): bash on Linux/macOS, PowerShell on Windows.
+# ---------------------------------------------------------------------------
+- name: Signature check (WARN only) (dotnet, Unix)
+  if: matrix.type == 'dotnet' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    if dotnet nuget verify "${DOTNET_NUPKG}" >/tmp/nuget_verify.txt 2>&1; then
+      echo "NuGet signature verified:"; cat /tmp/nuget_verify.txt
+    else
+      echo "::warning::Package '${DOTNET_NUPKG}' is unsigned or signature could not be verified on public CI (no signing secrets). Structural-only check; not blocking."
+      cat /tmp/nuget_verify.txt || true
+    fi
+
+- name: Signature check (WARN only) (dotnet, Windows)
+  if: matrix.type == 'dotnet' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Continue'
+    $out = & dotnet nuget verify "$env:DOTNET_NUPKG" 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host "NuGet signature verified:`n$out"
+    } else {
+      Write-Warning "Package '$env:DOTNET_NUPKG' is unsigned or signature could not be verified on public CI (no signing secrets). Structural-only check; not blocking."
+      Write-Host $out
+    }
+
+# ---------------------------------------------------------------------------
+# USER-SCOPE INSTALL (global tool): binaries land in
+#   Linux/macOS: $HOME/.dotnet/tools   Windows: %USERPROFILE%\.dotnet\tools
+# We install from the locally built package via --add-source (G2: our artifact,
+# not nuget.org). Per-shell (G4). Install is run directly; non-zero fails the job.
+# ---------------------------------------------------------------------------
+- name: Install user-scope global tool (dotnet, Unix)
+  if: matrix.type == 'dotnet' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    dotnet tool install --global "${DOTNET_PKG_ID}" \
+      --version "${DOTNET_PKG_VER}" \
+      --add-source "${DOTNET_SRC_DIR}"
+    echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+- name: Install user-scope global tool (dotnet, Windows)
+  if: matrix.type == 'dotnet' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $proc = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+      -ArgumentList @('tool','install','--global', $env:DOTNET_PKG_ID,
+                      '--version', $env:DOTNET_PKG_VER,
+                      '--add-source', $env:DOTNET_SRC_DIR)
+    if ($proc.ExitCode -ne 0) { throw "dotnet tool install --global failed with exit code $($proc.ExitCode)" }
+    "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+# ---------------------------------------------------------------------------
+# G5 / LAUNCH SMOKE: a .NET tool is a console app, so a real launch IS running
+# the installed command. We run the actual installed binary (not the source
+# tree) and assert exit code 0. We try `--version`, then fall back to `--help`,
+# so this works regardless of which the tool implements; either must exit 0.
+# ---------------------------------------------------------------------------
+- name: Launch / smoke-verify installed tool (dotnet, Unix)
+  if: matrix.type == 'dotnet' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    CMD="${DOTNET_TOOL_CMD:-${DOTNET_PKG_ID}}"
+    BIN="$HOME/.dotnet/tools/${CMD}"
+    if [ ! -x "${BIN}" ]; then
+      echo "::error::Installed tool binary not found/executable at ${BIN}"
+      ls -la "$HOME/.dotnet/tools" || true
+      exit 1
+    fi
+    # Real invocation of the installed binary; non-zero from BOTH probes fails.
+    if ! "${BIN}" --version; then
+      echo "--version not supported; falling back to --help"
+      "${BIN}" --help
+    fi
+    echo "Smoke OK: ${CMD} launched from installed location and exited 0."
+
+- name: Launch / smoke-verify installed tool (dotnet, Windows)
+  if: matrix.type == 'dotnet' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $cmd = if ($env:DOTNET_TOOL_CMD) { $env:DOTNET_TOOL_CMD } else { $env:DOTNET_PKG_ID }
+    $bin = Join-Path "$env:USERPROFILE\.dotnet\tools" "$cmd.exe"
+    if (-not (Test-Path $bin)) { throw "Installed tool binary not found at $bin" }
+    $proc = Start-Process -FilePath $bin -Wait -PassThru -NoNewWindow -ArgumentList @('--version')
+    if ($proc.ExitCode -ne 0) {
+      Write-Host "--version returned $($proc.ExitCode); falling back to --help"
+      $proc = Start-Process -FilePath $bin -Wait -PassThru -NoNewWindow -ArgumentList @('--help')
+      if ($proc.ExitCode -ne 0) { throw "Installed tool failed to launch (--version and --help both non-zero: $($proc.ExitCode))" }
+    }
+    Write-Host "Smoke OK: $cmd launched from installed location and exited 0."
+
+# ---------------------------------------------------------------------------
+# SYSTEM-SCOPE INSTALL (tool-path): the real system-scope analog for .NET tools.
+# Installs to a shared location NOT on the user PATH; we invoke by full path.
+# This proves the system-scope distinction is exercised, per the brief.
+# ---------------------------------------------------------------------------
+- name: Install + smoke system-scope (tool-path) (dotnet, Unix)
+  if: matrix.type == 'dotnet' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    TP="${RUNNER_TEMP}/dotnet-systemtools"
+    rm -rf "${TP}"; mkdir -p "${TP}"
+    dotnet tool install "${DOTNET_PKG_ID}" \
+      --version "${DOTNET_PKG_VER}" \
+      --add-source "${DOTNET_SRC_DIR}" \
+      --tool-path "${TP}"
+    CMD="${DOTNET_TOOL_CMD:-${DOTNET_PKG_ID}}"
+    BIN="${TP}/${CMD}"
+    [ -x "${BIN}" ] || { echo "::error::tool-path binary missing at ${BIN}"; ls -la "${TP}"; exit 1; }
+    if ! "${BIN}" --version; then "${BIN}" --help; fi
+    echo "DOTNET_TOOLPATH=${TP}" >> "$GITHUB_ENV"
+    echo "System-scope (tool-path) install + smoke OK."
+
+- name: Install + smoke system-scope (tool-path) (dotnet, Windows)
+  if: matrix.type == 'dotnet' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $tp = Join-Path $env:RUNNER_TEMP 'dotnet-systemtools'
+    if (Test-Path $tp) { Remove-Item -Recurse -Force $tp }
+    New-Item -ItemType Directory -Force -Path $tp | Out-Null
+    $proc = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+      -ArgumentList @('tool','install', $env:DOTNET_PKG_ID,
+                      '--version', $env:DOTNET_PKG_VER,
+                      '--add-source', $env:DOTNET_SRC_DIR,
+                      '--tool-path', $tp)
+    if ($proc.ExitCode -ne 0) { throw "tool-path install failed: $($proc.ExitCode)" }
+    $cmd = if ($env:DOTNET_TOOL_CMD) { $env:DOTNET_TOOL_CMD } else { $env:DOTNET_PKG_ID }
+    $bin = Join-Path $tp "$cmd.exe"
+    if (-not (Test-Path $bin)) { throw "tool-path binary missing at $bin" }
+    $proc = Start-Process -FilePath $bin -Wait -PassThru -NoNewWindow -ArgumentList @('--version')
+    if ($proc.ExitCode -ne 0) {
+      $proc = Start-Process -FilePath $bin -Wait -PassThru -NoNewWindow -ArgumentList @('--help')
+      if ($proc.ExitCode -ne 0) { throw "tool-path smoke failed: $($proc.ExitCode)" }
+    }
+    "DOTNET_TOOLPATH=$tp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "System-scope (tool-path) install + smoke OK."
+
+# ---------------------------------------------------------------------------
+# G6: REAL UPGRADE. First install an ACTUAL PREVIOUS published version from
+# nuget.org to create genuine dirty state, then `dotnet tool update` to the
+# locally built version. Graceful skip if no prior published version exists.
+# Uses a fresh tool-path so it is independent of the user-scope install above.
+# ---------------------------------------------------------------------------
+- name: Upgrade over a real previous release (dotnet, Unix)
+  if: matrix.type == 'dotnet' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    UP="${RUNNER_TEMP}/dotnet-upgrade"
+    rm -rf "${UP}"; mkdir -p "${UP}"
+    CMD="${DOTNET_TOOL_CMD:-${DOTNET_PKG_ID}}"
+
+    # Install latest PUBLISHED version from nuget.org (real prior state).
+    # G6: distinguish "no published version exists yet" (legitimate SKIP) from a
+    # real download/feed failure (must FAIL). We capture the exit status WITHOUT
+    # set -e aborting (guarded by 'if'), then inspect the output:
+    #   * NU1101 / "Unable to find package" / "No packages exist with this id"
+    #     => the tool was simply never published yet -> visible ::notice:: SKIP.
+    #   * any other non-zero (network, feed/service-index, auth, timeout, NU1301)
+    #     => a genuine failure -> hard exit 1 (never swallow & go green).
+    set +e
+    dotnet tool install "${DOTNET_PKG_ID}" --tool-path "${UP}" >/tmp/prev.txt 2>&1
+    PREV_RC=$?
+    set -e
+    cat /tmp/prev.txt || true
+    if [ "${PREV_RC}" -eq 0 ]; then
+      echo "Installed prior published version."
+      PREV_VER="$("${UP}/${CMD}" --version 2>/dev/null | head -n1 || echo unknown)"
+      echo "Prior version reports: ${PREV_VER}"
+      # Add our freshly built package as a source and update to it.
+      dotnet tool update "${DOTNET_PKG_ID}" \
+        --version "${DOTNET_PKG_VER}" \
+        --add-source "${DOTNET_SRC_DIR}" \
+        --tool-path "${UP}"
+      BIN="${UP}/${CMD}"
+      [ -x "${BIN}" ] || { echo "::error::post-upgrade binary missing at ${BIN}"; exit 1; }
+      if ! "${BIN}" --version; then "${BIN}" --help; fi
+      echo "DOTNET_UPGRADE_PATH=${UP}" >> "$GITHUB_ENV"
+      echo "Upgrade over real previous release: OK."
+    elif grep -qiE 'NU1101|Unable to find package|No packages exist with this id|is not found on source' /tmp/prev.txt; then
+      echo "::notice::SKIPPED real-upgrade test: no prior published version of '${DOTNET_PKG_ID}' exists on nuget.org yet (nothing to upgrade over)."
+    else
+      echo "::error::Failed to download prior published version of '${DOTNET_PKG_ID}' (exit ${PREV_RC}); this is NOT a 'package missing' condition (network/feed/auth error). Failing instead of silently skipping."
+      exit 1
+    fi
+
+- name: Upgrade over a real previous release (dotnet, Windows)
+  if: matrix.type == 'dotnet' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $up = Join-Path $env:RUNNER_TEMP 'dotnet-upgrade'
+    if (Test-Path $up) { Remove-Item -Recurse -Force $up }
+    New-Item -ItemType Directory -Force -Path $up | Out-Null
+    $cmd = if ($env:DOTNET_TOOL_CMD) { $env:DOTNET_TOOL_CMD } else { $env:DOTNET_PKG_ID }
+
+    # G6: distinguish "no published version exists yet" (legitimate SKIP) from a
+    # real download/feed failure (must FAIL). Capture stdout+stderr and inspect:
+    # NU1101 / "Unable to find package" => never published -> ::notice:: SKIP;
+    # any other non-zero (network/feed/auth/timeout) => hard fail, never skip green.
+    $prevLog = Join-Path $env:RUNNER_TEMP 'dotnet-prev-install.txt'
+    $prev = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+      -ArgumentList @('tool','install', $env:DOTNET_PKG_ID, '--tool-path', $up) `
+      -RedirectStandardOutput $prevLog -RedirectStandardError "$prevLog.err"
+    $prevOut = ((Get-Content $prevLog -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content "$prevLog.err" -Raw -ErrorAction SilentlyContinue))
+    Write-Host $prevOut
+    if ($prev.ExitCode -ne 0) {
+      if ($prevOut -match 'NU1101|Unable to find package|No packages exist with this id|is not found on source') {
+        Write-Host "::notice::SKIPPED real-upgrade test: no prior published version of '$($env:DOTNET_PKG_ID)' exists on nuget.org yet (nothing to upgrade over)."
+      } else {
+        throw "Failed to download prior published version of '$($env:DOTNET_PKG_ID)' (exit $($prev.ExitCode)); not a 'package missing' condition (network/feed/auth error). Failing instead of silently skipping."
+      }
+    } else {
+      $bin = Join-Path $up "$cmd.exe"
+      $upd = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+        -ArgumentList @('tool','update', $env:DOTNET_PKG_ID,
+                        '--version', $env:DOTNET_PKG_VER,
+                        '--add-source', $env:DOTNET_SRC_DIR,
+                        '--tool-path', $up)
+      if ($upd.ExitCode -ne 0) { throw "dotnet tool update (upgrade) failed: $($upd.ExitCode)" }
+      if (-not (Test-Path $bin)) { throw "post-upgrade binary missing at $bin" }
+      $smoke = Start-Process -FilePath $bin -Wait -PassThru -NoNewWindow -ArgumentList @('--version')
+      if ($smoke.ExitCode -ne 0) {
+        $smoke = Start-Process -FilePath $bin -Wait -PassThru -NoNewWindow -ArgumentList @('--help')
+        if ($smoke.ExitCode -ne 0) { throw "post-upgrade smoke failed: $($smoke.ExitCode)" }
+      }
+      "DOTNET_UPGRADE_PATH=$up" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      Write-Host "Upgrade over real previous release: OK."
+    }
+
+# ---------------------------------------------------------------------------
+# G7: REAL UNINSTALL + NEGATIVE ASSERTION. Uninstall every scope we installed
+# (user-global, tool-path, and the upgrade path if it was created) and assert
+# the binaries are actually GONE. Any remaining file turns the job red.
+# ---------------------------------------------------------------------------
+- name: Uninstall + verify full removal (dotnet, Unix)
+  if: matrix.type == 'dotnet' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    CMD="${DOTNET_TOOL_CMD:-${DOTNET_PKG_ID}}"
+
+    # 1) user-scope global
+    dotnet tool uninstall --global "${DOTNET_PKG_ID}"
+    if [ -e "$HOME/.dotnet/tools/${CMD}" ]; then
+      echo "::error::Global tool binary still present after uninstall: $HOME/.dotnet/tools/${CMD}"; exit 1
+    fi
+
+    # 2) system-scope tool-path
+    dotnet tool uninstall "${DOTNET_PKG_ID}" --tool-path "${DOTNET_TOOLPATH}"
+    if [ -e "${DOTNET_TOOLPATH}/${CMD}" ]; then
+      echo "::error::tool-path binary still present after uninstall: ${DOTNET_TOOLPATH}/${CMD}"; exit 1
+    fi
+
+    # 3) upgrade path (only if the upgrade test actually ran)
+    if [ -n "${DOTNET_UPGRADE_PATH:-}" ]; then
+      dotnet tool uninstall "${DOTNET_PKG_ID}" --tool-path "${DOTNET_UPGRADE_PATH}"
+      if [ -e "${DOTNET_UPGRADE_PATH}/${CMD}" ]; then
+        echo "::error::upgrade-path binary still present after uninstall: ${DOTNET_UPGRADE_PATH}/${CMD}"; exit 1
+      fi
+    fi
+
+    # Final negative assertion: it must no longer resolve as a global tool.
+    if dotnet tool list --global | grep -i -- "${DOTNET_PKG_ID}"; then
+      echo "::error::Package '${DOTNET_PKG_ID}' still listed as a global tool after uninstall."; exit 1
+    fi
+    echo "Uninstall verified: all installed binaries removed."
+    # TRIPWIRE: a full lifecycle completed (build -> install -> launch -> upgrade
+    # -> uninstall+verify) on this OS. Catches an all-skip leg going green.
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify full removal (dotnet, Windows)
+  if: matrix.type == 'dotnet' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $cmd = if ($env:DOTNET_TOOL_CMD) { $env:DOTNET_TOOL_CMD } else { $env:DOTNET_PKG_ID }
+
+    # 1) user-scope global
+    $u = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+      -ArgumentList @('tool','uninstall','--global', $env:DOTNET_PKG_ID)
+    if ($u.ExitCode -ne 0) { throw "global uninstall failed: $($u.ExitCode)" }
+    $gbin = Join-Path "$env:USERPROFILE\.dotnet\tools" "$cmd.exe"
+    if (Test-Path $gbin) { throw "Global tool binary still present after uninstall: $gbin" }
+
+    # 2) system-scope tool-path
+    $u2 = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+      -ArgumentList @('tool','uninstall', $env:DOTNET_PKG_ID, '--tool-path', $env:DOTNET_TOOLPATH)
+    if ($u2.ExitCode -ne 0) { throw "tool-path uninstall failed: $($u2.ExitCode)" }
+    $tbin = Join-Path $env:DOTNET_TOOLPATH "$cmd.exe"
+    if (Test-Path $tbin) { throw "tool-path binary still present after uninstall: $tbin" }
+
+    # 3) upgrade path (only if the upgrade test actually ran)
+    if ($env:DOTNET_UPGRADE_PATH) {
+      $u3 = Start-Process -FilePath 'dotnet' -Wait -PassThru -NoNewWindow `
+        -ArgumentList @('tool','uninstall', $env:DOTNET_PKG_ID, '--tool-path', $env:DOTNET_UPGRADE_PATH)
+      if ($u3.ExitCode -ne 0) { throw "upgrade-path uninstall failed: $($u3.ExitCode)" }
+      $ubin = Join-Path $env:DOTNET_UPGRADE_PATH "$cmd.exe"
+      if (Test-Path $ubin) { throw "upgrade-path binary still present after uninstall: $ubin" }
+    }
+
+    # Final negative assertion: must no longer resolve as a global tool.
+    $list = & dotnet tool list --global | Out-String
+    if ($list -match [regex]::Escape($env:DOTNET_PKG_ID)) {
+      throw "Package '$($env:DOTNET_PKG_ID)' still listed as a global tool after uninstall."
+    }
+    Write-Host "Uninstall verified: all installed binaries removed."
+    # TRIPWIRE: a full lifecycle completed on this OS. Catches an all-skip leg.
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

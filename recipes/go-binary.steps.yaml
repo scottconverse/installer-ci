@@ -1,0 +1,438 @@
+- name: Checkout
+  if: matrix.type == 'go-binary'
+  uses: actions/checkout@v4
+
+- name: Set up Go
+  if: matrix.type == 'go-binary'
+  uses: actions/setup-go@v6
+  with:
+    # Pin the toolchain to whatever the module declares; avoids drift.
+    go-version-file: go.mod
+    cache: true
+
+# ----------------------------------------------------------------------------
+# BUILD (G2): produce the binary in the job. Never assume dist/ exists.
+# Pure-static, reproducible build. Output name differs by OS (.exe on Windows).
+# ----------------------------------------------------------------------------
+- name: Build binary (Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  env:
+    CGO_ENABLED: '0'
+  run: |
+    set -euo pipefail
+    mkdir -p dist
+    # ${{ env.APP_NAME }} / ${{ env.MAIN_PKG }} are workflow-level inputs;
+    # default MAIN_PKG to '.' if the main package is the repo root.
+    APP_NAME="${APP_NAME:-app}"
+    MAIN_PKG="${MAIN_PKG:-.}"
+    go build -trimpath -ldflags "-s -w" -o "dist/${APP_NAME}" "${MAIN_PKG}"
+    echo "ARTIFACT_PATH=dist/${APP_NAME}" >> "$GITHUB_ENV"
+    echo "APP_NAME=${APP_NAME}" >> "$GITHUB_ENV"
+
+- name: Build binary (Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    CGO_ENABLED: '0'
+  run: |
+    $ErrorActionPreference = 'Stop'
+    New-Item -ItemType Directory -Force -Path dist | Out-Null
+    $app = if ($env:APP_NAME) { $env:APP_NAME } else { 'app' }
+    $pkg = if ($env:MAIN_PKG) { $env:MAIN_PKG } else { '.' }
+    go build -trimpath -ldflags "-s -w" -o "dist/$app.exe" "$pkg"
+    if ($LASTEXITCODE -ne 0) { throw "go build failed with exit code $LASTEXITCODE" }
+    "ARTIFACT_PATH=dist/$app.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    "APP_NAME=$app"             | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+# ----------------------------------------------------------------------------
+# VERIFY ARTIFACT EXISTS (G2): hard-fail before any install attempt.
+# ----------------------------------------------------------------------------
+- name: Verify artifact exists (Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    test -f "${ARTIFACT_PATH}" || { echo "::error::Build artifact ${ARTIFACT_PATH} not found"; exit 1; }
+    test -s "${ARTIFACT_PATH}" || { echo "::error::Build artifact ${ARTIFACT_PATH} is empty"; exit 1; }
+    chmod +x "${ARTIFACT_PATH}"
+    file "${ARTIFACT_PATH}" || true
+    echo "Artifact OK: $(ls -l "${ARTIFACT_PATH}")"
+
+- name: Verify artifact exists (Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-Path -Path $env:ARTIFACT_PATH)) { throw "Build artifact $env:ARTIFACT_PATH not found" }
+    if ((Get-Item $env:ARTIFACT_PATH).Length -le 0) { throw "Build artifact $env:ARTIFACT_PATH is empty" }
+    Write-Host "Artifact OK:"; Get-Item $env:ARTIFACT_PATH | Format-List FullName,Length
+
+# ----------------------------------------------------------------------------
+# SIGNING / GATEKEEPER (G8): Go binaries are unsigned by default.
+# On public CI without signing secrets we do a STRUCTURAL check and WARN only.
+# macOS: codesign/spctl (expect "code object is not signed at all" -> warn).
+# Windows: Authenticode status (expect NotSigned -> warn). Never hard-fail here.
+# ----------------------------------------------------------------------------
+- name: Signing / notarization check (macOS, warn-only)
+  if: matrix.type == 'go-binary' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -uo pipefail
+    echo "::group::codesign -dvv"
+    if codesign -dvv "${ARTIFACT_PATH}" 2>&1; then
+      echo "Binary carries a code signature."
+    else
+      echo "::warning::Go binary is unsigned (codesign found no signature). On end-user macOS this triggers Gatekeeper quarantine unless the user clears the com.apple.quarantine xattr or you notarize the release. Set up Developer ID signing + notarytool for production."
+    fi
+    echo "::endgroup::"
+    echo "::group::spctl assessment"
+    spctl -a -vvv -t install "${ARTIFACT_PATH}" 2>&1 || \
+      echo "::warning::spctl assessment rejected the unsigned binary (expected on public CI)."
+    echo "::endgroup::"
+
+- name: Signing check (Windows, warn-only)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $sig = Get-AuthenticodeSignature -FilePath $env:ARTIFACT_PATH
+    Write-Host "Authenticode status: $($sig.Status)"
+    if ($sig.Status -ne 'Valid') {
+      Write-Host "::warning::Go binary is not Authenticode-signed (status=$($sig.Status)). On end-user Windows this triggers SmartScreen/Defender warnings. Use signtool with a code-signing cert for production releases."
+    } else {
+      Write-Host "Binary is Authenticode-signed by: $($sig.SignerCertificate.Subject)"
+    }
+
+# ----------------------------------------------------------------------------
+# INSTALL - USER SCOPE: copy binary onto a per-user PATH dir.
+# Unix: ~/.local/bin ; Windows: %LOCALAPPDATA%\Programs\<app>\bin (+ add to PATH).
+# G1: cp/Copy-Item fail-fast under strict mode; assert the file landed.
+# ----------------------------------------------------------------------------
+- name: Install (user scope, Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    USER_BIN="${HOME}/.local/bin"
+    mkdir -p "${USER_BIN}"
+    install -m 0755 "${ARTIFACT_PATH}" "${USER_BIN}/${APP_NAME}"
+    test -x "${USER_BIN}/${APP_NAME}" || { echo "::error::User-scope install missing"; exit 1; }
+    echo "${USER_BIN}" >> "$GITHUB_PATH"
+    echo "USER_BIN=${USER_BIN}" >> "$GITHUB_ENV"
+    echo "Installed to user scope: ${USER_BIN}/${APP_NAME}"
+
+- name: Install (user scope, Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $userBin = Join-Path $env:LOCALAPPDATA "Programs\$($env:APP_NAME)\bin"
+    New-Item -ItemType Directory -Force -Path $userBin | Out-Null
+    Copy-Item -Path $env:ARTIFACT_PATH -Destination (Join-Path $userBin "$($env:APP_NAME).exe") -Force
+    $dest = Join-Path $userBin "$($env:APP_NAME).exe"
+    if (-not (Test-Path $dest)) { throw "User-scope install missing: $dest" }
+    Add-Content -Path $env:GITHUB_PATH -Value $userBin
+    "USER_BIN=$userBin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Installed to user scope: $dest"
+
+# ----------------------------------------------------------------------------
+# LAUNCH / SMOKE-VERIFY (G5): a Go binary is a CLI, not a GUI, so a real
+# invocation (--version / --help) that returns exit 0 IS the correct smoke test.
+# G1: capture exit code explicitly and fail the job if non-zero.
+# Uses the freshly-installed copy resolved off PATH, not the dist/ artifact.
+# ----------------------------------------------------------------------------
+- name: Launch / smoke test (Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    command -v "${APP_NAME}" >/dev/null 2>&1 || { echo "::error::${APP_NAME} not on PATH after install"; exit 1; }
+    # Prefer --version; fall back to --help. Either must exit 0.
+    if "${APP_NAME}" --version; then
+      echo "smoke: --version OK"
+    elif "${APP_NAME}" --help; then
+      echo "smoke: --help OK"
+    else
+      echo "::error::Installed binary failed to launch (--version and --help both non-zero)"
+      exit 1
+    fi
+
+- name: Launch / smoke test (Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $exe = Get-Command "$($env:APP_NAME).exe" -ErrorAction SilentlyContinue
+    if (-not $exe) { throw "$($env:APP_NAME).exe not on PATH after install" }
+    $p = Start-Process -FilePath $exe.Source -ArgumentList '--version' -NoNewWindow -Wait -PassThru
+    if ($p.ExitCode -ne 0) {
+      $h = Start-Process -FilePath $exe.Source -ArgumentList '--help' -NoNewWindow -Wait -PassThru
+      if ($h.ExitCode -ne 0) { throw "Installed binary failed to launch (--version exit $($p.ExitCode), --help exit $($h.ExitCode))" }
+    }
+    Write-Host "smoke: launch OK"
+
+# ----------------------------------------------------------------------------
+# INSTALL - SYSTEM SCOPE: copy onto a system-wide PATH dir.
+# Unix: /usr/local/bin (needs sudo). Windows: %ProgramFiles% (admin; GH runner
+# user is admin, so this works). Real distinction from user-scope install.
+# ----------------------------------------------------------------------------
+- name: Install (system scope, Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    SYS_BIN="/usr/local/bin"
+    sudo install -m 0755 "${ARTIFACT_PATH}" "${SYS_BIN}/${APP_NAME}"
+    test -x "${SYS_BIN}/${APP_NAME}" || { echo "::error::System-scope install missing"; exit 1; }
+    echo "SYS_BIN=${SYS_BIN}" >> "$GITHUB_ENV"
+    # Verify it launches from the system path explicitly.
+    "${SYS_BIN}/${APP_NAME}" --version || "${SYS_BIN}/${APP_NAME}" --help || \
+      { echo "::error::System-scope binary failed to launch"; exit 1; }
+    echo "Installed to system scope: ${SYS_BIN}/${APP_NAME}"
+
+- name: Install (system scope, Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $sysBin = Join-Path $env:ProgramFiles "$($env:APP_NAME)\bin"
+    New-Item -ItemType Directory -Force -Path $sysBin | Out-Null
+    $dest = Join-Path $sysBin "$($env:APP_NAME).exe"
+    Copy-Item -Path $env:ARTIFACT_PATH -Destination $dest -Force
+    if (-not (Test-Path $dest)) { throw "System-scope install missing: $dest" }
+    "SYS_BIN=$sysBin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    $p = Start-Process -FilePath $dest -ArgumentList '--version' -NoNewWindow -Wait -PassThru
+    if ($p.ExitCode -ne 0) {
+      $h = Start-Process -FilePath $dest -ArgumentList '--help' -NoNewWindow -Wait -PassThru
+      if ($h.ExitCode -ne 0) { throw "System-scope binary failed to launch (exit $($p.ExitCode))" }
+    }
+    Write-Host "Installed to system scope: $dest"
+
+# ----------------------------------------------------------------------------
+# UPGRADE (G6): FIRST install a REAL previous release to create dirty state,
+# THEN install the freshly-built current binary OVER it and verify it replaced
+# the old one. Graceful skip if the repo has no prior published release.
+# Asset names follow the GoReleaser/standard convention:
+#   <app>_<os>_<arch>.tar.gz (Unix) / <app>_<os>_<arch>.zip (Windows).
+# G3: download URL uses gh release download (handles the
+#     https://github.com/OWNER/REPO/releases/download/TAG/ASSET path correctly).
+# ----------------------------------------------------------------------------
+- name: Upgrade over previous release (Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    set -euo pipefail
+    UP_BIN="${HOME}/.local/bin"
+    mkdir -p "${UP_BIN}"
+
+    # Resolve latest published release tag. An API error must FAIL (not skip);
+    # only a genuinely empty release list is a legitimate skip.
+    PREV_TAG="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')" \
+      || { echo "::error::gh release list failed (API/auth error); cannot determine prior release"; exit 1; }
+    if [ -z "${PREV_TAG}" ] || [ "${PREV_TAG}" = "null" ]; then
+      echo "::notice::No prior release found; skipping upgrade test (clean-machine install is NOT an upgrade)."
+      exit 0
+    fi
+    echo "Previous release: ${PREV_TAG}"
+
+    # Map runner to GoReleaser-style os/arch tokens.
+    case "$(uname -s)" in Darwin) OS=darwin;; Linux) OS=linux;; *) OS=unknown;; esac
+    case "$(uname -m)" in x86_64|amd64) ARCH=amd64;; arm64|aarch64) ARCH=arm64;; *) ARCH=$(uname -m);; esac
+    ASSET="${APP_NAME}_${OS}_${ARCH}.tar.gz"
+
+    # Enumerate the release's asset names FIRST so we can distinguish
+    # "no matching asset exists" (legitimate skip) from "download failed"
+    # (network/auth error -> MUST hard-fail, never swallow into a green skip).
+    ASSET_NAMES="$(gh release view "${PREV_TAG}" --repo "${{ github.repository }}" \
+        --json assets --jq '.assets[].name')"
+    PATTERN=""
+    if printf '%s\n' "${ASSET_NAMES}" | grep -qx "${ASSET}"; then
+      PATTERN="${ASSET}"
+    else
+      # Fall back to any tar.gz for this OS regardless of arch token.
+      MATCH="$(printf '%s\n' "${ASSET_NAMES}" | grep -E "^${APP_NAME}_${OS}_.*\.tar\.gz$" | head -n1 || true)"
+      if [ -n "${MATCH}" ]; then
+        echo "::warning::Exact asset ${ASSET} not in ${PREV_TAG}; using ${MATCH} instead."
+        PATTERN="${MATCH}"
+      fi
+    fi
+    if [ -z "${PATTERN}" ]; then
+      echo "::notice::No matching ${OS} tar.gz asset for ${APP_NAME} in ${PREV_TAG}; skipping upgrade test (artifact variant absent, lifecycle not exercised)."
+      exit 0
+    fi
+
+    tmp="$(mktemp -d)"
+    # No 2>/dev/null and no '|| true': a genuine download failure now fails the job.
+    gh release download "${PREV_TAG}" --repo "${{ github.repository }}" \
+        --pattern "${PATTERN}" --dir "${tmp}" \
+      || { echo "::error::Download of prior-release asset ${PATTERN} from ${PREV_TAG} failed"; exit 1; }
+
+    tar -xzf "${tmp}"/*.tar.gz -C "${tmp}"
+    OLD_BIN="$(find "${tmp}" -type f -name "${APP_NAME}" | head -n1)"
+    [ -n "${OLD_BIN}" ] || { echo "::notice::No '${APP_NAME}' binary inside archive; skipping."; exit 0; }
+
+    # macOS: strip com.apple.quarantine so an unsigned prior release does not
+    # hard-fail Gatekeeper when launched below (G6/G8 stays warn-only).
+    if [ "${OS}" = "darwin" ]; then
+      xattr -dr com.apple.quarantine "${OLD_BIN}" 2>/dev/null || true
+    fi
+
+    # 1) Install the OLD version to create genuine dirty state.
+    install -m 0755 "${OLD_BIN}" "${UP_BIN}/${APP_NAME}"
+    OLD_VER="$("${UP_BIN}/${APP_NAME}" --version 2>/dev/null || echo 'unknown')"
+    echo "Installed previous version reports: ${OLD_VER}"
+
+    # 2) Upgrade IN PLACE with the freshly-built current binary.
+    install -m 0755 "${ARTIFACT_PATH}" "${UP_BIN}/${APP_NAME}"
+    NEW_VER="$("${UP_BIN}/${APP_NAME}" --version 2>/dev/null || echo 'unknown')"
+    echo "After upgrade reports: ${NEW_VER}"
+
+    # 3) Verify the on-disk binary is now the current build, and it still launches.
+    "${UP_BIN}/${APP_NAME}" --version || "${UP_BIN}/${APP_NAME}" --help || \
+      { echo "::error::Upgraded binary failed to launch"; exit 1; }
+    if [ "${OLD_VER}" != "unknown" ] && [ "${NEW_VER}" != "unknown" ] && [ "${OLD_VER}" = "${NEW_VER}" ]; then
+      echo "::warning::Version string unchanged after upgrade (${NEW_VER}); ensure -ldflags injects version, or prior release was same version."
+    fi
+    echo "Upgrade over ${PREV_TAG} succeeded."
+
+- name: Upgrade over previous release (Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ github.token }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $upBin = Join-Path $env:LOCALAPPDATA "Programs\$($env:APP_NAME)\bin"
+    New-Item -ItemType Directory -Force -Path $upBin | Out-Null
+
+    # An API error must FAIL (not skip); only an empty list is a legitimate skip.
+    $prevTag = (gh release list --repo "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+    if ($LASTEXITCODE -ne 0) { throw "gh release list failed (API/auth error); cannot determine prior release" }
+    if ([string]::IsNullOrWhiteSpace($prevTag) -or $prevTag -eq 'null') {
+      Write-Host "::notice::No prior release found; skipping upgrade test (clean install is NOT an upgrade)."
+      exit 0
+    }
+    Write-Host "Previous release: $prevTag"
+
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+    $asset = "$($env:APP_NAME)_windows_$arch.zip"
+    $tmp = Join-Path $env:RUNNER_TEMP ("up_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+    # Enumerate the release's asset names FIRST to distinguish "no matching asset"
+    # (legitimate skip) from "download failed" (network/auth -> MUST hard-fail).
+    $assetNames = (gh release view $prevTag --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+    if ($LASTEXITCODE -ne 0) { throw "Failed to query assets of release $prevTag" }
+    $names = @($assetNames -split "`n" | Where-Object { $_ -ne '' })
+    $pattern = $null
+    if ($names -contains $asset) {
+      $pattern = $asset
+    } else {
+      $match = $names | Where-Object { $_ -match "^$([regex]::Escape($env:APP_NAME))_windows_.*\.zip$" } | Select-Object -First 1
+      if ($match) {
+        Write-Host "::warning::Exact asset $asset not in $prevTag; using $match instead."
+        $pattern = $match
+      }
+    }
+    if (-not $pattern) {
+      Write-Host "::notice::No matching Windows zip asset for $($env:APP_NAME) in $prevTag; skipping upgrade test (artifact variant absent, lifecycle not exercised)."
+      exit 0
+    }
+
+    # No 2>$null: a genuine download failure now fails the job.
+    gh release download $prevTag --repo "${{ github.repository }}" --pattern $pattern --dir $tmp
+    if ($LASTEXITCODE -ne 0) { throw "Download of prior-release asset $pattern from $prevTag failed" }
+
+    $zip = Get-ChildItem -Path $tmp -Filter *.zip | Select-Object -First 1
+    Expand-Archive -Path $zip.FullName -DestinationPath $tmp -Force
+    $oldBin = Get-ChildItem -Path $tmp -Recurse -Filter "$($env:APP_NAME).exe" | Select-Object -First 1
+    if (-not $oldBin) { Write-Host "::notice::No $($env:APP_NAME).exe in archive; skipping."; exit 0 }
+
+    $dest = Join-Path $upBin "$($env:APP_NAME).exe"
+    # 1) Install OLD version (dirty state)
+    Copy-Item -Path $oldBin.FullName -Destination $dest -Force
+    $oldVer = (& $dest --version) 2>&1 | Out-String
+    Write-Host "Previous version reports: $($oldVer.Trim())"
+
+    # 2) Upgrade in place with current build
+    Copy-Item -Path $env:ARTIFACT_PATH -Destination $dest -Force
+    $p = Start-Process -FilePath $dest -ArgumentList '--version' -NoNewWindow -Wait -PassThru
+    if ($p.ExitCode -ne 0) {
+      $h = Start-Process -FilePath $dest -ArgumentList '--help' -NoNewWindow -Wait -PassThru
+      if ($h.ExitCode -ne 0) { throw "Upgraded binary failed to launch (exit $($p.ExitCode))" }
+    }
+    Write-Host "Upgrade over $prevTag succeeded."
+
+# ----------------------------------------------------------------------------
+# UNINSTALL + VERIFY REMOVAL (G7): remove from BOTH scopes, then NEGATIVE-ASSERT
+# that nothing remains (file gone AND not resolvable on PATH).
+# ----------------------------------------------------------------------------
+- name: Uninstall and verify removal (Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Remove user-scope and system-scope copies.
+    rm -f "${USER_BIN}/${APP_NAME}" || true
+    rm -f "${HOME}/.local/bin/${APP_NAME}" || true
+    sudo rm -f "${SYS_BIN:-/usr/local/bin}/${APP_NAME}" || true
+
+    FAIL=0
+    for f in "${USER_BIN}/${APP_NAME}" "${HOME}/.local/bin/${APP_NAME}" "${SYS_BIN:-/usr/local/bin}/${APP_NAME}"; do
+      if [ -e "${f}" ]; then echo "::error::Uninstall left file behind: ${f}"; FAIL=1; fi
+    done
+    # Negative assertion: must NOT resolve on PATH anymore (hash -r clears cache).
+    hash -r 2>/dev/null || true
+    if command -v "${APP_NAME}" >/dev/null 2>&1; then
+      echo "::error::${APP_NAME} still resolvable on PATH after uninstall: $(command -v "${APP_NAME}")"
+      FAIL=1
+    fi
+    [ "${FAIL}" -eq 0 ] || exit 1
+    echo "Uninstall verified: no residual files, not on PATH."
+
+- name: Uninstall and verify removal (Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $exeName = "$($env:APP_NAME).exe"
+    $userDest = Join-Path $env:USER_BIN $exeName
+    $sysDest  = Join-Path $env:SYS_BIN  $exeName
+    Remove-Item -Path $userDest -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $sysDest  -Force -ErrorAction SilentlyContinue
+    # Also remove the upgrade-scope copy.
+    Remove-Item -Path (Join-Path $env:LOCALAPPDATA "Programs\$($env:APP_NAME)\bin\$exeName") -Force -ErrorAction SilentlyContinue
+
+    $fail = $false
+    foreach ($f in @($userDest, $sysDest)) {
+      if ($f -and (Test-Path $f)) { Write-Host "::error::Uninstall left file behind: $f"; $fail = $true }
+    }
+    # Negative assertion on PATH resolution.
+    $still = Get-Command $exeName -ErrorAction SilentlyContinue
+    if ($still) { Write-Host "::error::$exeName still resolvable on PATH: $($still.Source)"; $fail = $true }
+    if ($fail) { throw "Uninstall verification failed." }
+    Write-Host "Uninstall verified: no residual files, not on PATH."
+
+# ----------------------------------------------------------------------------
+# LIFECYCLE TRIPWIRE: only reached after a full BUILD->INSTALL->LAUNCH->UPGRADE
+# ->UNINSTALL-verified pass. Lets a downstream gate catch an all-skip leg that
+# went green without exercising anything.
+# ----------------------------------------------------------------------------
+- name: Mark lifecycle complete (Unix)
+  if: matrix.type == 'go-binary' && runner.os != 'Windows'
+  shell: bash
+  run: |
+    set -euo pipefail
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+    echo "go-binary lifecycle complete on ${RUNNER_OS}."
+
+- name: Mark lifecycle complete (Windows)
+  if: matrix.type == 'go-binary' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "go-binary lifecycle complete on $env:RUNNER_OS."

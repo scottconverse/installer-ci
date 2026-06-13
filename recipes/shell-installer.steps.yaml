@@ -1,0 +1,344 @@
+  # ============================================================================
+  # shell-installer slice
+  # Genuine OS targets: Linux + macOS. A POSIX shell installer (install.sh,
+  # *.run, makeself, `curl | sh`) is native to Linux/macOS only; Windows is
+  # excluded on purpose (route Windows shell installers through WSL2 instead of
+  # faking a native pass). Gate the whole slice on matrix.type == 'shell-installer'.
+  #
+  # Env contract this slice expects (set at job/workflow level):
+  #   INSTALLER_GLOB   : glob to the built installer, e.g. dist/install*.sh
+  #   APP_BIN          : installed command name to smoke, e.g. civiccast
+  #   IS_GUI           : 'true' | 'false' (drives G5 real-launch path)
+  #   REPO_SLUG        : OWNER/REPO for release downloads (defaults to this repo)
+  # ============================================================================
+
+  - name: shell-installer | Checkout
+    if: matrix.type == 'shell-installer'
+    uses: actions/checkout@v4
+
+  # --- G2: BUILD THE ARTIFACT (never assume dist/ pre-exists) ----------------
+  - name: shell-installer | Build installer (Linux)
+    if: matrix.type == 'shell-installer' && runner.os == 'Linux'
+    shell: bash
+    run: |
+      set -euo pipefail
+      # Build the self-contained shell installer. Prefer the repo's own build
+      # entrypoint; fall back to a documented make target. Adjust to your repo.
+      if [ -x ./scripts/build-installer.sh ]; then
+        ./scripts/build-installer.sh
+      elif [ -f Makefile ] && make -n installer >/dev/null 2>&1; then
+        make installer
+      else
+        echo "::error::No installer build entrypoint found (scripts/build-installer.sh or 'make installer')."
+        exit 1
+      fi
+
+  - name: shell-installer | Build installer (macOS)
+    if: matrix.type == 'shell-installer' && runner.os == 'macOS'
+    shell: bash
+    run: |
+      set -euo pipefail
+      if [ -x ./scripts/build-installer.sh ]; then
+        ./scripts/build-installer.sh
+      elif [ -f Makefile ] && make -n installer >/dev/null 2>&1; then
+        make installer
+      else
+        echo "::error::No installer build entrypoint found (scripts/build-installer.sh or 'make installer')."
+        exit 1
+      fi
+
+  # --- G2: ASSERT ARTIFACT EXISTS + resolve a single path --------------------
+  - name: shell-installer | Verify artifact exists
+    if: matrix.type == 'shell-installer'
+    shell: bash
+    run: |
+      set -euo pipefail
+      glob="${INSTALLER_GLOB:-dist/install*.sh}"
+      # shellcheck disable=SC2086
+      matches=$(ls -1 $glob 2>/dev/null || true)
+      count=$(printf '%s\n' "$matches" | grep -c . || true)
+      if [ "$count" -ne 1 ]; then
+        echo "::error::Expected exactly 1 installer matching '$glob', found $count:"
+        printf '%s\n' "$matches"
+        exit 1
+      fi
+      installer="$matches"
+      test -s "$installer" || { echo "::error::Installer '$installer' is empty."; exit 1; }
+      chmod +x "$installer" || true
+      echo "Found installer: $installer ($(wc -c < "$installer") bytes)"
+      echo "INSTALLER_PATH=$installer" >> "$GITHUB_ENV"
+
+  # --- G8: signing / notarization (macOS Gatekeeper) — WARN, do not block ----
+  # Public CI has no signing secrets. We do a structural check so signing state
+  # is VISIBLE without hard-failing an unsigned dev build.
+  - name: shell-installer | Signing check (macOS, warn-only)
+    if: matrix.type == 'shell-installer' && runner.os == 'macOS'
+    shell: bash
+    run: |
+      set -uo pipefail
+      target="${INSTALLER_PATH:?}"
+      echo "::group::codesign / spctl inspection"
+      if codesign -dv --verbose=4 "$target" 2>&1; then
+        echo "codesign: present"
+      else
+        echo "::warning::Installer is not code-signed (expected on unsigned public CI)."
+      fi
+      # Gatekeeper assessment for executable installers.
+      if spctl -a -vvv --type execute "$target" 2>&1; then
+        echo "spctl: Gatekeeper accepts."
+      else
+        echo "::warning::spctl rejects (no Developer ID / not notarized on public CI)."
+      fi
+      echo "::endgroup::"
+      exit 0
+
+  # ===========================================================================
+  # USER-SCOPE install (no sudo). PREFIX under $HOME — the common default for a
+  # shell installer's unprivileged path.
+  # ===========================================================================
+  # --- G1: run installer directly under set -euo pipefail; crash => red ------
+  - name: shell-installer | Install (user scope)
+    if: matrix.type == 'shell-installer'
+    shell: bash
+    run: |
+      set -euo pipefail
+      prefix="$HOME/.local"
+      mkdir -p "$prefix/bin"
+      echo "Installing to user prefix: $prefix"
+      # G1: ONE canonical invocation. A `... --flags || ... bare` fallback would
+      # swallow a genuine installer failure (the bare form papers over it) and go
+      # green. Honor both PREFIX env and the documented flags in a single call.
+      PREFIX="$prefix" "$INSTALLER_PATH" --prefix "$prefix" --yes
+      echo "$prefix/bin" >> "$GITHUB_PATH"
+
+  # --- G5 (CLI app) real launch + smoke for user-scope install ---------------
+  - name: shell-installer | Launch + smoke (CLI, user scope)
+    if: matrix.type == 'shell-installer' && env.IS_GUI != 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+      bin="${APP_BIN:?APP_BIN must be set}"
+      installed="$HOME/.local/bin/$bin"
+      test -x "$installed" || { echo "::error::Installed binary missing: $installed"; exit 1; }
+      # Real launch: exercise the binary and assert clean exit, not just presence.
+      "$installed" --version
+      "$installed" --help >/dev/null
+      echo "User-scope CLI smoke OK."
+
+  # --- G5 (GUI app) REAL headless launch for user-scope install --------------
+  # Linux: xvfb-run + background launch, then assert the process is alive.
+  - name: shell-installer | Launch + smoke (GUI, Linux, user scope)
+    if: matrix.type == 'shell-installer' && runner.os == 'Linux' && env.IS_GUI == 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+      sudo apt-get update -qq
+      sudo apt-get install -y -qq xvfb
+      bin="${APP_BIN:?APP_BIN must be set}"
+      installed="$HOME/.local/bin/$bin"
+      test -x "$installed" || { echo "::error::Installed binary missing: $installed"; exit 1; }
+      # G5: $! is the xvfb-run WRAPPER pid, NOT the app — the wrapper (and Xvfb)
+      # can stay alive after the inner app crashes, producing a false pass. So
+      # verify the REAL installed app by pgrep-ing its ABSOLUTE install path.
+      xvfb-run -a -- "$installed" &
+      wrapper_pid=$!
+      sleep 8
+      app_pid="$(pgrep -f "$installed" | head -n1 || true)"
+      if [ -z "$app_pid" ]; then
+        echo "::error::GUI app exited/crashed within 8s of launch (no process matching $installed)."
+        kill "$wrapper_pid" 2>/dev/null || true
+        exit 1
+      fi
+      echo "GUI app alive (pid $app_pid, $installed) after 8s."
+      pkill -f "$installed" 2>/dev/null || true
+      kill "$wrapper_pid" 2>/dev/null || true
+      wait "$app_pid" 2>/dev/null || true
+
+  # macOS: open the installed .app bundle, then assert the process is running.
+  - name: shell-installer | Launch + smoke (GUI, macOS, user scope)
+    if: matrix.type == 'shell-installer' && runner.os == 'macOS' && env.IS_GUI == 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+      app_name="${APP_BIN:?APP_BIN must be set}"
+      app_path="$HOME/Applications/${app_name}.app"
+      test -d "$app_path" || { echo "::error::Installed .app missing: $app_path"; exit 1; }
+      # G5: resolve the REAL MachO binary and pgrep its ABSOLUTE path. Matching the
+      # bundle dir would also match the launching `open` process (and helpers) =
+      # false pass. CFBundleExecutable gives the actual inner binary name.
+      inner="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+      bin="$app_path/Contents/MacOS/$inner"
+      test -x "$bin" || { echo "::error::app binary missing/not executable: $bin"; exit 1; }
+      open -g "$app_path"
+      sleep 8
+      if ! pgrep -f "$bin" >/dev/null; then
+        echo "::error::GUI .app is not running 8s after open (no process matching $bin)."
+        exit 1
+      fi
+      echo "GUI .app running after 8s ($bin)."
+      pkill -f "$bin" 2>/dev/null || true
+
+  # ===========================================================================
+  # SYSTEM-SCOPE install (sudo, PREFIX=/usr/local). The privileged path of a
+  # shell installer is a genuinely distinct code path worth covering.
+  # ===========================================================================
+  - name: shell-installer | Install (system scope, sudo)
+    if: matrix.type == 'shell-installer' && runner.os != 'Windows'
+    shell: bash
+    run: |
+      set -euo pipefail
+      prefix="/usr/local"
+      echo "Installing to system prefix: $prefix (sudo)"
+      # G1: keep set -e semantics across sudo by invoking the installer directly,
+      # via ONE canonical invocation. A `... || sudo ... bare` fallback would mask
+      # a real failure of the privileged install path and produce a false pass.
+      sudo PREFIX="$prefix" "$INSTALLER_PATH" --prefix "$prefix" --system --yes
+
+  - name: shell-installer | Launch + smoke (system scope, CLI)
+    if: matrix.type == 'shell-installer' && env.IS_GUI != 'true'
+    shell: bash
+    run: |
+      set -euo pipefail
+      bin="${APP_BIN:?APP_BIN must be set}"
+      # System-scope binary should be on PATH at /usr/local/bin.
+      command -v "$bin" >/dev/null || { echo "::error::System binary not on PATH: $bin"; exit 1; }
+      resolved="$(command -v "$bin")"
+      case "$resolved" in
+        /usr/local/*) : ;;
+        *) echo "::warning::Resolved '$bin' at '$resolved' (expected /usr/local). PATH order?";;
+      esac
+      "$bin" --version
+      echo "System-scope CLI smoke OK ($resolved)."
+
+  # ===========================================================================
+  # G6: REAL UPGRADE — install an ACTUAL previous published release first to
+  # create genuine dirty state, then run the freshly built installer over it.
+  # Graceful skip when no prior release exists.
+  # ===========================================================================
+  - name: shell-installer | Upgrade over previous release
+    if: matrix.type == 'shell-installer' && runner.os != 'Windows'
+    shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    run: |
+      set -euo pipefail
+      slug="${REPO_SLUG:-${{ github.repository }}}"
+      prefix="$HOME/.local"
+      mkdir -p "$prefix/bin"
+
+      # Find the latest published, non-draft release tag.
+      # G6: distinguish "no releases exist" (legit skip) from "API call failed"
+      # (must HARD-FAIL). Do NOT swallow errors with `2>/dev/null || true` and then
+      # silently skip green — capture the command's real exit status.
+      if ! release_json="$(gh release list --repo "$slug" --limit 1 --json tagName,isDraft)"; then
+        echo "::error::gh release list failed for $slug (API/auth error, not 'no releases')."
+        exit 1
+      fi
+      tag="$(printf '%s' "$release_json" | jq -r '[.[] | select(.isDraft|not)][0].tagName // empty')"
+      if [ -z "$tag" ]; then
+        echo "::notice::No prior published release for $slug — skipping upgrade test (G6 graceful skip)."
+        exit 0
+      fi
+      echo "Previous release tag: $tag"
+
+      # Pick a shell-installer asset from that release.
+      if ! assets_json="$(gh release view "$tag" --repo "$slug" --json assets)"; then
+        echo "::error::gh release view failed for $slug $tag (API error, not 'no asset')."
+        exit 1
+      fi
+      asset="$(printf '%s' "$assets_json" | jq -r '.assets[].name | select(test("install.*\\.sh$|\\.run$"))' | head -n1)"
+      if [ -z "$asset" ]; then
+        echo "::notice::Release $tag has no shell-installer asset — skipping upgrade test (G6 graceful skip)."
+        exit 0
+      fi
+
+      # G3: correct release download URL (proper slashes), via gh to keep auth.
+      workdir="$(mktemp -d)"
+      gh release download "$tag" --repo "$slug" --pattern "$asset" --dir "$workdir"
+      old_installer="$workdir/$asset"
+      test -s "$old_installer" || { echo "::error::Downloaded prior installer is empty."; exit 1; }
+      chmod +x "$old_installer"
+      # G6 (macOS): strip the quarantine xattr a downloaded asset carries so an
+      # unsigned prior release does not get blocked by Gatekeeper on execution.
+      # (G8 stays warn-only — this only affects the downloaded prior artifact.)
+      if [ "${RUNNER_OS:-}" = "macOS" ]; then
+        xattr -dr com.apple.quarantine "$old_installer" 2>/dev/null || true
+      fi
+
+      # Establish dirty state: install the OLD version (G1 exit-code integrity).
+      # ONE canonical invocation — a `... || ... bare` fallback would mask a real
+      # failure installing the prior release and let the upgrade test pass falsely.
+      PREFIX="$prefix" "$old_installer" --prefix "$prefix" --yes
+      bin="${APP_BIN:?APP_BIN must be set}"
+      old_ver="$("$prefix/bin/$bin" --version 2>/dev/null || echo 'unknown')"
+      echo "Installed previous version: $old_ver"
+
+      # Now UPGRADE with the freshly built installer over the dirty state (G1).
+      PREFIX="$prefix" "$INSTALLER_PATH" --prefix "$prefix" --yes
+      new_ver="$("$prefix/bin/$bin" --version 2>/dev/null || echo 'unknown')"
+      echo "Upgraded version now reports: $new_ver"
+
+      # Post-upgrade the binary must still launch cleanly.
+      "$prefix/bin/$bin" --version >/dev/null || { echo "::error::Upgraded binary fails to launch."; exit 1; }
+      if [ "$new_ver" = "$old_ver" ] && [ "$old_ver" != "unknown" ]; then
+        echo "::warning::Version string unchanged across upgrade ($old_ver). Confirm version bump in build."
+      fi
+      echo "Upgrade-over-previous-release OK."
+
+  # ===========================================================================
+  # G7: REAL UNINSTALL — run the uninstaller, then NEGATIVE-ASSERT that the
+  # binary/app/files are actually gone. Anything remaining fails the job.
+  # ===========================================================================
+  - name: shell-installer | Uninstall + verify removal (user scope)
+    if: matrix.type == 'shell-installer'
+    shell: bash
+    run: |
+      set -euo pipefail
+      prefix="$HOME/.local"
+      bin="${APP_BIN:?APP_BIN must be set}"
+      installed="$prefix/bin/$bin"
+
+      # Prefer the installer's own uninstall path; fall back to a sibling script.
+      # (The final negative assertions are the real guard against a no-op
+      # uninstall, so probing two mechanisms here is safe.)
+      if "$INSTALLER_PATH" --uninstall --prefix "$prefix" --yes; then
+        echo "Uninstalled via installer --uninstall."
+      elif [ -x "$prefix/bin/${bin}-uninstall" ]; then
+        PREFIX="$prefix" "$prefix/bin/${bin}-uninstall" --yes
+        echo "Uninstalled via ${bin}-uninstall."
+      else
+        echo "::error::No uninstall entrypoint (installer --uninstall or ${bin}-uninstall)."
+        exit 1
+      fi
+
+      # NEGATIVE ASSERTIONS — fail if anything is left behind.
+      leftover=0
+      if [ -e "$installed" ]; then echo "::error::Leftover binary: $installed"; leftover=1; fi
+      if command -v "$bin" >/dev/null 2>&1 && [ "$(command -v "$bin")" = "$installed" ]; then
+        echo "::error::'$bin' still resolves to the user-scope path after uninstall."; leftover=1
+      fi
+      # macOS user .app bundle, if this was a GUI install.
+      if [ "${IS_GUI:-false}" = "true" ] && [ "$RUNNER_OS" = "macOS" ]; then
+        if [ -d "$HOME/Applications/${bin}.app" ]; then
+          echo "::error::Leftover .app: $HOME/Applications/${bin}.app"; leftover=1
+        fi
+      fi
+      if [ "$leftover" -ne 0 ]; then
+        echo "::error::Uninstall left files behind (G7 negative assertion failed)."
+        exit 1
+      fi
+      echo "Uninstall verified clean — nothing remains in $prefix."
+
+  # ===========================================================================
+  # TRIPWIRE — only reached after a FULL successful lifecycle (build → install →
+  # launch → upgrade → uninstall+verify). This slice runs on Linux + macOS only,
+  # so gate on runner.os != 'Windows' to fire the marker on every OS this type
+  # runs on. An all-skip leg never reaches here, so downstream catches it.
+  # ===========================================================================
+  - name: shell-installer | Lifecycle marker (tripwire)
+    if: matrix.type == 'shell-installer' && runner.os != 'Windows'
+    shell: bash
+    run: |
+      set -euo pipefail
+      echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+      echo "shell-installer lifecycle complete on $RUNNER_OS — LIFECYCLE_OK=1 set."

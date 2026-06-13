@@ -1,0 +1,414 @@
+- name: Checkout
+  if: matrix.type == 'electron'
+  uses: actions/checkout@v4
+
+- name: Set up Node.js
+  if: matrix.type == 'electron'
+  uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: npm
+
+- name: Install dependencies
+  if: matrix.type == 'electron'
+  shell: bash
+  run: |
+    set -euo pipefail
+    if [ -f package-lock.json ]; then
+      npm ci
+    else
+      npm install
+    fi
+
+# ---------------------------------------------------------------------------
+# G2: BUILD THE ARTIFACT. Never assume dist/ exists. electron-builder is the
+# dominant packager; produce the OS-native target explicitly. CSC_IDENTITY_AUTO_
+# DISCOVERY=false prevents electron-builder from attempting (and hard-failing on)
+# signing when no cert secrets are present on public CI.
+# ---------------------------------------------------------------------------
+- name: Build Electron installer (Linux AppImage)
+  if: matrix.type == 'electron' && runner.os == 'Linux'
+  shell: bash
+  env:
+    CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    set -euo pipefail
+    npx --no-install electron-builder --linux AppImage --publish never
+    echo "Built artifacts:"; ls -la dist/
+
+- name: Build Electron installer (macOS DMG)
+  if: matrix.type == 'electron' && runner.os == 'macOS'
+  shell: bash
+  env:
+    CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    set -euo pipefail
+    npx --no-install electron-builder --mac dmg --publish never
+    echo "Built artifacts:"; ls -la dist/
+
+- name: Build Electron installer (Windows NSIS)
+  if: matrix.type == 'electron' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    npx --no-install electron-builder --win nsis --publish never
+    if ($LASTEXITCODE -ne 0) { throw "electron-builder failed with exit $LASTEXITCODE" }
+    Write-Host "Built artifacts:"; Get-ChildItem dist
+
+# ---------------------------------------------------------------------------
+# G2: VERIFY THE ARTIFACT EXISTS before install. Resolve the exact path and
+# export it for downstream steps. Fail hard (negative path) if nothing matched.
+# ---------------------------------------------------------------------------
+- name: Verify artifact exists (Linux)
+  if: matrix.type == 'electron' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    artifact="$(find dist -maxdepth 1 -name '*.AppImage' | head -n1)"
+    if [ -z "$artifact" ] || [ ! -f "$artifact" ]; then
+      echo "::error::No .AppImage artifact found in dist/"; exit 1
+    fi
+    echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+    echo "Verified artifact: $artifact"
+
+- name: Verify artifact exists (macOS)
+  if: matrix.type == 'electron' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    artifact="$(find dist -maxdepth 1 -name '*.dmg' | head -n1)"
+    if [ -z "$artifact" ] || [ ! -f "$artifact" ]; then
+      echo "::error::No .dmg artifact found in dist/"; exit 1
+    fi
+    echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+    echo "Verified artifact: $artifact"
+
+- name: Verify artifact exists (Windows)
+  if: matrix.type == 'electron' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $artifact = Get-ChildItem dist -Filter '*.exe' | Where-Object { $_.Name -match 'Setup|setup' } | Select-Object -First 1
+    if (-not $artifact) { $artifact = Get-ChildItem dist -Filter '*.exe' | Select-Object -First 1 }
+    if (-not $artifact -or -not (Test-Path $artifact.FullName)) {
+      Write-Error "No NSIS .exe artifact found in dist/"; exit 1
+    }
+    "ARTIFACT=$($artifact.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Verified artifact: $($artifact.FullName)"
+
+# ---------------------------------------------------------------------------
+# G8: SIGNING / NOTARIZATION (structural, WARN-only on public CI without secrets).
+# macOS: codesign -dv + spctl Gatekeeper assessment. Windows: Authenticode.
+# Linux AppImage has no OS-level signing requirement -> informational only.
+# ---------------------------------------------------------------------------
+- name: Check code signature (macOS, WARN-only)
+  if: matrix.type == 'electron' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -uo pipefail
+    mnt="$(mktemp -d)"
+    hdiutil attach "$ARTIFACT" -nobrowse -readonly -mountpoint "$mnt" >/dev/null
+    app="$(find "$mnt" -maxdepth 1 -name '*.app' | head -n1)"
+    if [ -z "$app" ]; then
+      echo "::warning::No .app inside DMG to assess signing"; hdiutil detach "$mnt" >/dev/null || true; exit 0
+    fi
+    echo "codesign verbose:"; codesign -dv --verbose=4 "$app" 2>&1 || echo "::warning::app is unsigned (expected on public CI without CSC secrets)"
+    if codesign --verify --deep --strict "$app" 2>/dev/null; then
+      echo "codesign verify: OK"
+    else
+      echo "::warning::codesign --verify failed (unsigned/ad-hoc build on public CI)"
+    fi
+    if spctl --assess --type execute --verbose=4 "$app" 2>&1 | grep -q accepted; then
+      echo "Gatekeeper: accepted"
+    else
+      echo "::warning::Gatekeeper would reject this app (not notarized) - expected without notarization secrets"
+    fi
+    hdiutil detach "$mnt" >/dev/null || true
+
+- name: Check Authenticode signature (Windows, WARN-only)
+  if: matrix.type == 'electron' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Continue'
+    $sig = Get-AuthenticodeSignature -FilePath $env:ARTIFACT
+    Write-Host "Authenticode status: $($sig.Status)"
+    if ($sig.Status -ne 'Valid') {
+      Write-Warning "Installer is not Authenticode-signed (Status=$($sig.Status)). Expected on public CI without signing secrets; SmartScreen would warn end users."
+    } else {
+      Write-Host "Signed by: $($sig.SignerCertificate.Subject)"
+    }
+
+- name: Note Linux AppImage signing (informational)
+  if: matrix.type == 'electron' && runner.os == 'Linux'
+  shell: bash
+  run: echo "::notice::AppImage has no OS-enforced code signing; optional GPG signing not configured."
+
+# ---------------------------------------------------------------------------
+# INSTALL + LAUNCH (G1 exit codes, G5 real GUI launch).
+# Linux AppImage: user-scope by nature (no system install). chmod +x and run.
+# ---------------------------------------------------------------------------
+- name: Install + launch (Linux, AppImage, user-scope)
+  if: matrix.type == 'electron' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get update
+    sudo apt-get install -y libfuse2 xvfb
+    installed="$HOME/.local/bin/electron-app-under-test.AppImage"
+    install -Dm755 "$ARTIFACT" "$installed"
+    test -x "$installed" || { echo "::error::installed AppImage not executable"; exit 1; }
+    # G5: real headless GUI launch. --no-sandbox required for AppImage chrome-sandbox under CI.
+    # NOTE: $! would be the xvfb-run WRAPPER pid (stays alive even if Electron crashes),
+    # so verify the REAL inner app by its full install path via pgrep.
+    xvfb-run -a --server-args="-screen 0 1280x1024x24" \
+      "$installed" --no-sandbox --enable-logging &
+    wrapper_pid=$!
+    sleep 15
+    app_pid="$(pgrep -f "$installed" | head -n1 || true)"
+    if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
+      echo "App is alive (pid $app_pid) - GUI launch OK"
+      pkill -f "$installed" 2>/dev/null || true
+      kill "$wrapper_pid" 2>/dev/null || true
+      wait "$wrapper_pid" 2>/dev/null || true
+    else
+      echo "::error::Electron app exited prematurely / no process matching $installed - launch failed"
+      pkill -f "$installed" 2>/dev/null || true
+      kill "$wrapper_pid" 2>/dev/null || true
+      exit 1
+    fi
+
+- name: Install + launch (macOS, DMG -> /Applications, system-scope)
+  if: matrix.type == 'electron' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    mnt="$(mktemp -d)"
+    hdiutil attach "$ARTIFACT" -nobrowse -mountpoint "$mnt"
+    app_src="$(find "$mnt" -maxdepth 1 -name '*.app' | head -n1)"
+    test -n "$app_src" || { echo "::error::no .app inside DMG"; hdiutil detach "$mnt" || true; exit 1; }
+    app_name="$(basename "$app_src")"
+    sudo cp -R "$app_src" /Applications/
+    hdiutil detach "$mnt"
+    app_path="/Applications/$app_name"
+    test -d "$app_path" || { echo "::error::app not installed to /Applications"; exit 1; }
+    echo "APP_PATH=$app_path" >> "$GITHUB_ENV"
+    echo "APP_NAME=$app_name" >> "$GITHUB_ENV"
+    bin="$app_path/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
+    test -x "$bin" || { echo "::error::app binary missing/not executable: $bin"; exit 1; }
+    echo "APP_BIN=$bin" >> "$GITHUB_ENV"
+    # G5: real GUI launch (macOS runners have a window server, no xvfb needed).
+    open -a "$app_path"
+    sleep 15
+    # G5: match the ABSOLUTE binary path - a bare basename ("Electron"/helper) would
+    # substring-match unrelated processes and produce a false pass.
+    if pgrep -f "$bin" >/dev/null; then
+      echo "App process running ($bin) - GUI launch OK"
+      osascript -e "quit app \"${app_name%.app}\"" 2>/dev/null || pkill -f "$bin" || true
+    else
+      echo "::error::Electron app did not start (no process matching $bin)"; exit 1
+    fi
+
+- name: Install + launch (Windows, NSIS, per-user + per-machine)
+  if: matrix.type == 'electron' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # G1: -Wait -PassThru + assert ExitCode. NSIS silent flag /S; allusers per-machine.
+    $proc = Start-Process -FilePath $env:ARTIFACT -ArgumentList '/S','/allusers' -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { Write-Error "Installer exited with $($proc.ExitCode)"; exit 1 }
+    # Resolve installed exe: electron-builder NSIS per-machine default -> %ProgramFiles%; per-user -> %LOCALAPPDATA%\Programs
+    $roots = @(
+      "$env:ProgramFiles",
+      "${env:ProgramFiles(x86)}",
+      "$env:LOCALAPPDATA\Programs"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+    $exe = $null
+    foreach ($r in $roots) {
+      $exe = Get-ChildItem -Path $r -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue |
+             Where-Object { $_.VersionInfo.FileDescription -or $_.FullName -match 'Electron|app' } |
+             Select-Object -First 1
+      if ($exe) { break }
+    }
+    if (-not $exe) { Write-Error "Installed Electron exe not found under $($roots -join ', ')"; exit 1 }
+    if (-not (Test-Path $exe.FullName)) { Write-Error "Resolved exe path missing: $($exe.FullName)"; exit 1 }
+    "INSTALLED_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    "INSTALL_DIR=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+    Write-Host "Installed exe: $($exe.FullName)"
+    # G5: real GUI launch (Windows runner has an interactive desktop session).
+    $app = Start-Process -FilePath $exe.FullName -PassThru
+    Start-Sleep -Seconds 15
+    $live = Get-Process -Id $app.Id -ErrorAction SilentlyContinue
+    if (-not $live) { Write-Error "Electron app process exited prematurely - launch failed"; exit 1 }
+    Write-Host "App process running (pid $($app.Id)) - GUI launch OK"
+    Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+    Get-Process | Where-Object { $_.Path -eq $exe.FullName } | Stop-Process -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+# G6: REAL UPGRADE. Download the latest PUBLISHED release asset (a genuine prior
+# version), install it FIRST to create dirty state, THEN install the freshly
+# built current artifact over it. Graceful skip when no prior release exists.
+# G3: correct ${{ }} expressions + proper release-download URL slashes.
+# ---------------------------------------------------------------------------
+- name: Upgrade over previous release (Linux)
+  if: matrix.type == 'electron' && runner.os == 'Linux'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    REPO: ${{ github.repository }}
+  run: |
+    set -euo pipefail
+    asset_url="$(gh release view --repo "$REPO" --json assets \
+      --jq '.assets[] | select(.name | endswith(".AppImage")) | .url' 2>/dev/null | head -n1 || true)"
+    if [ -z "$asset_url" ]; then
+      echo "::notice::No prior published .AppImage release - skipping upgrade test"; exit 0
+    fi
+    echo "Prior asset: $asset_url"
+    curl -fL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+      -o prev.AppImage "$asset_url"
+    install -Dm755 prev.AppImage "$HOME/.local/bin/electron-app-under-test.AppImage"
+    test -x "$HOME/.local/bin/electron-app-under-test.AppImage"
+    echo "Prior version installed (dirty state created)."
+    # Upgrade: overwrite with current build.
+    install -Dm755 "$ARTIFACT" "$HOME/.local/bin/electron-app-under-test.AppImage"
+    test -x "$HOME/.local/bin/electron-app-under-test.AppImage" || { echo "::error::upgrade overwrite failed"; exit 1; }
+    echo "Upgrade applied over prior version."
+
+- name: Upgrade over previous release (macOS)
+  if: matrix.type == 'electron' && runner.os == 'macOS'
+  shell: bash
+  env:
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    REPO: ${{ github.repository }}
+  run: |
+    set -euo pipefail
+    asset_url="$(gh release view --repo "$REPO" --json assets \
+      --jq '.assets[] | select(.name | endswith(".dmg")) | .url' 2>/dev/null | head -n1 || true)"
+    if [ -z "$asset_url" ]; then
+      echo "::notice::No prior published .dmg release - skipping upgrade test"; exit 0
+    fi
+    echo "Prior asset: $asset_url"
+    curl -fL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+      -o prev.dmg "$asset_url"
+    mnt="$(mktemp -d)"
+    hdiutil attach prev.dmg -nobrowse -mountpoint "$mnt"
+    prev_app="$(find "$mnt" -maxdepth 1 -name '*.app' | head -n1)"
+    test -n "$prev_app" || { echo "::error::no .app in prior DMG"; hdiutil detach "$mnt" || true; exit 1; }
+    prev_name="$(basename "$prev_app")"
+    sudo rm -rf "/Applications/$prev_name"
+    sudo cp -R "$prev_app" /Applications/
+    hdiutil detach "$mnt"
+    test -d "/Applications/$prev_name" || { echo "::error::prior app not installed"; exit 1; }
+    # G6: strip Gatekeeper quarantine from the downloaded prior release so an
+    # unsigned prior build does not hard-fail (G8 stays warn-only).
+    sudo xattr -dr com.apple.quarantine "/Applications/$prev_name" 2>/dev/null || true
+    echo "Prior version installed (dirty state created)."
+    # Upgrade: install current build over it.
+    mnt2="$(mktemp -d)"
+    hdiutil attach "$ARTIFACT" -nobrowse -mountpoint "$mnt2"
+    cur_app="$(find "$mnt2" -maxdepth 1 -name '*.app' | head -n1)"
+    cur_name="$(basename "$cur_app")"
+    sudo rm -rf "/Applications/$cur_name"
+    sudo cp -R "$cur_app" /Applications/
+    hdiutil detach "$mnt2"
+    test -d "/Applications/$cur_name" || { echo "::error::upgrade install failed"; exit 1; }
+    # Persist BOTH installed app names so the uninstall step removes/asserts every variant.
+    echo "PREV_APP_NAME=$prev_name" >> "$GITHUB_ENV"
+    echo "CUR_APP_NAME=$cur_name" >> "$GITHUB_ENV"
+    echo "Upgrade applied over prior version."
+
+- name: Upgrade over previous release (Windows)
+  if: matrix.type == 'electron' && runner.os == 'Windows'
+  shell: pwsh
+  env:
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    REPO: ${{ github.repository }}
+  run: |
+    $ErrorActionPreference = 'Stop'
+    $assetUrl = (gh release view --repo "$env:REPO" --json assets `
+      --jq '.assets[] | select(.name | endswith(".exe")) | .url' 2>$null | Select-Object -First 1)
+    if (-not $assetUrl) {
+      Write-Host "::notice::No prior published .exe release - skipping upgrade test"; exit 0
+    }
+    Write-Host "Prior asset: $assetUrl"
+    $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/octet-stream' }
+    Invoke-WebRequest -Uri $assetUrl -Headers $headers -OutFile prev.exe
+    $p1 = Start-Process -FilePath (Resolve-Path prev.exe) -ArgumentList '/S','/allusers' -Wait -PassThru
+    if ($p1.ExitCode -ne 0) { Write-Error "Prior installer failed ($($p1.ExitCode))"; exit 1 }
+    Write-Host "Prior version installed (dirty state created)."
+    # Upgrade: run current installer over it.
+    $p2 = Start-Process -FilePath $env:ARTIFACT -ArgumentList '/S','/allusers' -Wait -PassThru
+    if ($p2.ExitCode -ne 0) { Write-Error "Upgrade installer failed ($($p2.ExitCode))"; exit 1 }
+    Write-Host "Upgrade applied over prior version."
+
+# ---------------------------------------------------------------------------
+# G7: REAL UNINSTALL + negative removal assertion (fails if anything remains).
+# ---------------------------------------------------------------------------
+- name: Uninstall + verify removal (Linux)
+  if: matrix.type == 'electron' && runner.os == 'Linux'
+  shell: bash
+  run: |
+    set -euo pipefail
+    target="$HOME/.local/bin/electron-app-under-test.AppImage"
+    rm -f "$target"
+    # AppImage may create a per-user config dir on first run; clean conservatively.
+    rm -rf "$HOME/.config/electron-app-under-test" 2>/dev/null || true
+    if [ -e "$target" ]; then
+      echo "::error::AppImage still present after uninstall: $target"; exit 1
+    fi
+    echo "Uninstall verified: AppImage removed."
+    # Tripwire: full lifecycle completed on this OS leg (catches all-skip downstream).
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify removal (macOS)
+  if: matrix.type == 'electron' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Remove EVERY variant installed during launch/upgrade and assert each is gone.
+    # Names come from the install step (APP_NAME) and the upgrade step
+    # (PREV_APP_NAME from the prior release, CUR_APP_NAME from the new build).
+    targets=()
+    [ -n "${APP_NAME:-}" ] && targets+=("/Applications/$APP_NAME")
+    [ -n "${PREV_APP_NAME:-}" ] && targets+=("/Applications/$PREV_APP_NAME")
+    [ -n "${CUR_APP_NAME:-}" ] && targets+=("/Applications/$CUR_APP_NAME")
+    if [ "${#targets[@]}" -eq 0 ]; then
+      echo "::error::no installed app names recorded - nothing to uninstall (would be a false pass)"; exit 1
+    fi
+    for t in "${targets[@]}"; do
+      sudo rm -rf "$t"
+    done
+    # G7: negative assertion - every variant must be gone.
+    for t in "${targets[@]}"; do
+      if [ -e "$t" ]; then
+        echo "::error::app still present after uninstall: $t"; exit 1
+      fi
+    done
+    echo "Uninstall verified: .app removed from /Applications."
+    # Tripwire: full lifecycle completed on this OS leg (catches all-skip downstream).
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
+- name: Uninstall + verify removal (Windows)
+  if: matrix.type == 'electron' && runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $ErrorActionPreference = 'Stop'
+    # electron-builder NSIS drops Uninstall <App>.exe next to the app.
+    $uninstaller = Get-ChildItem -Path $env:INSTALL_DIR -Filter 'Uninstall*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $uninstaller) { Write-Error "Uninstaller not found in $env:INSTALL_DIR"; exit 1 }
+    # G1: -Wait -PassThru + assert exit code.
+    $proc = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S','--force-run=false' -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { Write-Error "Uninstaller exited with $($proc.ExitCode)"; exit 1 }
+    Start-Sleep -Seconds 5
+    # G7: negative assertion - install dir / exe must be gone.
+    if (Test-Path $env:INSTALLED_EXE) { Write-Error "Installed exe still present: $env:INSTALLED_EXE"; exit 1 }
+    if ((Test-Path $env:INSTALL_DIR) -and (Get-ChildItem $env:INSTALL_DIR -ErrorAction SilentlyContinue)) {
+      Write-Error "Install dir not empty after uninstall: $env:INSTALL_DIR"; exit 1
+    }
+    Write-Host "Uninstall verified: exe and install dir removed."
+    # Tripwire: full lifecycle completed on this OS leg (catches all-skip downstream).
+    "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

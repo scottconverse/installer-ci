@@ -1,0 +1,278 @@
+- name: 'homebrew-formula | Resolve formula file and name'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  id: hbf
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Locate the formula .rb file (G2: never assume a path; discover + assert).
+    FORMULA_FILE=""
+    for cand in Formula/*.rb HomebrewFormula/*.rb *.rb; do
+      for f in $cand; do
+        [ -f "$f" ] || continue
+        if grep -qE '<\s*Formula' "$f"; then FORMULA_FILE="$f"; break 2; fi
+      done
+    done
+    if [ -z "$FORMULA_FILE" ]; then
+      echo "::error::No Homebrew formula (.rb with 'class X < Formula') found in repo."
+      exit 1
+    fi
+    # Formula name = file basename without .rb (Homebrew's canonical naming rule).
+    FORMULA_NAME="$(basename "$FORMULA_FILE" .rb)"
+    echo "Found formula: $FORMULA_NAME ($FORMULA_FILE)"
+    echo "file=$FORMULA_FILE"  >> "$GITHUB_OUTPUT"
+    echo "name=$FORMULA_NAME" >> "$GITHUB_OUTPUT"
+
+- name: 'homebrew-formula | Ensure brew on PATH'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    # Linuxbrew lives outside default PATH on ubuntu runners; macos has brew already.
+    if ! command -v brew >/dev/null 2>&1; then
+      if [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+        eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+      fi
+    fi
+    command -v brew >/dev/null 2>&1 || { echo "::error::brew not available on this runner"; exit 1; }
+    # Persist brew env to every subsequent step.
+    brew shellenv >> "$GITHUB_ENV"
+    brew --version
+
+- name: 'homebrew-formula | Audit formula (structure validation)'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    # G1: brew audit returns nonzero on real structural errors -> turns job red.
+    # --strict surfaces style/correctness issues. Run against the local file path.
+    brew audit --strict --formula "${{ steps.hbf.outputs.file }}"
+
+- name: 'homebrew-formula | BUILD artifact (install --build-from-source, user-scope)'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    NAME="${{ steps.hbf.outputs.name }}"
+    FILE="${{ steps.hbf.outputs.file }}"
+    # Clean any preinstalled namesake so we build OUR formula from source (G2).
+    brew uninstall --force --ignore-dependencies "$NAME" 2>/dev/null || true
+    # G2: actually build the keg from the local .rb (the artifact). --build-from-source
+    # forces compilation rather than pulling a prebuilt bottle. Homebrew is user-owned
+    # (it refuses to run as root), so this IS the user-scope install; there is no real
+    # root/system-scope install for a formula -- documenting rather than faking it.
+    # G1: set -e + brew nonzero exit makes a failed build red.
+    brew install --build-from-source --verbose --formula "$FILE"
+
+- name: 'homebrew-formula | VERIFY artifact exists (keg in Cellar)'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    NAME="${{ steps.hbf.outputs.name }}"
+    # G2: assert the built keg directory exists before trusting the install.
+    PREFIX="$(brew --prefix "$NAME")"
+    echo "Install prefix: $PREFIX"
+    [ -d "$PREFIX" ] || { echo "::error::keg prefix missing for $NAME"; exit 1; }
+    CELLAR="$(brew --cellar "$NAME")"
+    if [ ! -d "$CELLAR" ] || [ -z "$(ls -A "$CELLAR" 2>/dev/null)" ]; then
+      echo "::error::Cellar for $NAME empty/missing: $CELLAR"; exit 1
+    fi
+    echo "Cellar contents:"; ls -la "$CELLAR"
+    brew list --formula "$NAME" >/dev/null || { echo "::error::brew does not list $NAME after install"; exit 1; }
+
+- name: 'homebrew-formula | LAUNCH / smoke-verify (brew test + run installed binaries)'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    NAME="${{ steps.hbf.outputs.name }}"
+    # Primary smoke check: brew test runs the formula's `test do` block, the canonical
+    # functional verification for a formula. G1: nonzero exit fails the job.
+    if brew test --verbose "$NAME"; then
+      echo "brew test passed."
+    else
+      rc=$?
+      # Distinguish "no test block" (some formulae lack one) from a real failure.
+      if brew cat "$NAME" 2>/dev/null | grep -qE '^\s*test do'; then
+        echo "::error::brew test failed for $NAME (rc=$rc)"; exit 1
+      fi
+      echo "::warning::Formula $NAME defines no 'test do' block; relying on binary launch below."
+    fi
+    # Secondary real launch: execute each installed executable so a broken binary is caught
+    # (G5 -- a formula is a CLI tool, so actually invoking the binary is the real launch;
+    #  brew test above is the headless functional equivalent of launching a GUI).
+    PREFIX="$(brew --prefix "$NAME")"
+    RAN=0
+    if [ -d "$PREFIX/bin" ]; then
+      for bin in "$PREFIX/bin/"*; do
+        [ -x "$bin" ] || continue
+        RAN=1
+        echo "Launching: $bin"
+        # Try common no-op invocations; succeed if ANY returns 0 (some tools exit !=0 on --help).
+        if "$bin" --version >/dev/null 2>&1 \
+           || "$bin" --help    >/dev/null 2>&1 \
+           || "$bin" -h        >/dev/null 2>&1 \
+           || "$bin" version   >/dev/null 2>&1; then
+          echo "  OK: $bin responded to a smoke invocation"
+        else
+          echo "::error::Installed binary failed to launch: $bin"; exit 1
+        fi
+      done
+    fi
+    if [ "$RAN" = 0 ]; then
+      echo "::warning::Formula $NAME installed no executables in bin/; smoke limited to brew test."
+    fi
+
+- name: 'homebrew-formula | SIGNING / notarization check (macOS, WARN-only)'
+  if: matrix.type == 'homebrew-formula' && runner.os == 'macOS'
+  shell: bash
+  run: |
+    set -uo pipefail
+    NAME="${{ steps.hbf.outputs.name }}"
+    PREFIX="$(brew --prefix "$NAME")"
+    # G8: CLI formula binaries are not Gatekeeper-gated and Homebrew does not notarize,
+    # but we structurally inspect any Mach-O the formula installs and WARN (never hard-fail
+    # on public CI without signing secrets). If the formula ships a .app, codesign applies.
+    found_macho=0
+    while IFS= read -r f; do
+      file "$f" 2>/dev/null | grep -qiE 'Mach-O' || continue
+      found_macho=1
+      echo "== codesign -dv: $f =="
+      if codesign -dv --verbose=2 "$f" 2>&1; then
+        spctl --assess --type execute "$f" 2>&1 \
+          && echo "::notice::$f passes spctl assessment" \
+          || echo "::warning::$f not accepted by spctl (expected for unsigned CLI binary)"
+      else
+        echo "::warning::$f is unsigned (expected on public CI without signing secrets)"
+      fi
+    done < <(find "$PREFIX" -type f -perm -u+x 2>/dev/null)
+    # Any bundled .app -> stronger Gatekeeper check (still WARN-only).
+    while IFS= read -r app; do
+      echo "::notice::Found .app bundle: $app"
+      spctl --assess --type execute --verbose "$app" 2>&1 \
+        || echo "::warning::$app not notarized/accepted by Gatekeeper (WARN-only on public CI)"
+    done < <(find "$PREFIX" -name '*.app' -maxdepth 4 -type d 2>/dev/null)
+    [ "$found_macho" = 0 ] && echo "::notice::No Mach-O binaries found to sign-check for $NAME."
+    exit 0
+
+- name: 'homebrew-formula | UPGRADE over a real previous release'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  env:
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    set -euo pipefail
+    NAME="${{ steps.hbf.outputs.name }}"
+    FILE="${{ steps.hbf.outputs.file }}"
+    # G6: create GENUINE dirty state by installing the currently PUBLISHED formula first,
+    # then upgrade to our local build. Graceful skip ONLY if no prior published release
+    # exists; a download/build failure of a real prior release must FAIL (never swallow).
+    # Strategy: fetch the formula .rb as published at the latest GitHub release tag.
+    OWNER_REPO="${{ github.repository }}"
+    # G6: "no releases yet" is a legitimate skip; any OTHER gh error must surface, so
+    # only treat an empty-result (no releases) as a skip and let real failures propagate.
+    if gh release view --repo "$OWNER_REPO" --json tagName -q .tagName > "$RUNNER_TEMP/_tag.txt" 2>"$RUNNER_TEMP/_tag.err"; then
+      LATEST_TAG="$(cat "$RUNNER_TEMP/_tag.txt")"
+    elif grep -qiE 'release not found|no releases|not found' "$RUNNER_TEMP/_tag.err"; then
+      LATEST_TAG=""
+    else
+      echo "::error::gh release view failed for $OWNER_REPO (not a 'no releases' condition):"
+      cat "$RUNNER_TEMP/_tag.err"
+      exit 1
+    fi
+    if [ -z "$LATEST_TAG" ]; then
+      echo "::notice::SKIPPED real-upgrade test: no published GitHub release for $OWNER_REPO yet (G6 legitimate skip)."
+      echo "Upgrade step skipped (no prior release); lifecycle continues."
+      exit 0
+    fi
+    echo "Latest published release tag: $LATEST_TAG"
+    # G3: correct raw URL with proper slashes.
+    PREV_RB="$RUNNER_TEMP/prev_${NAME}.rb"
+    REL_PATH="${FILE}"
+    RAW_URL="https://raw.githubusercontent.com/${OWNER_REPO}/${LATEST_TAG}/${REL_PATH}"
+    echo "Fetching previous formula: $RAW_URL"
+    # G6: a real release tag exists, so a fetch failure is a DOWNLOAD FAILURE -> FAIL.
+    # Do NOT swallow with || true and skip green.
+    if ! curl -fsSL "$RAW_URL" -o "$PREV_RB"; then
+      echo "::error::Failed to download published formula at tag $LATEST_TAG ($RAW_URL). A release exists; this is a download failure, not a skip."
+      exit 1
+    fi
+    if ! grep -qE '<\s*Formula' "$PREV_RB"; then
+      echo "::error::Fetched file at $LATEST_TAG is not a Homebrew formula; cannot run real-upgrade test."
+      exit 1
+    fi
+    # If the published formula is byte-identical to local, there is genuinely no version
+    # delta to upgrade over -- a legitimate skip (visible ::notice::).
+    if cmp -s "$PREV_RB" "$FILE"; then
+      echo "::notice::SKIPPED real-upgrade test: published formula at $LATEST_TAG is byte-identical to working copy (no version delta, G6 legitimate skip)."
+      echo "Upgrade step skipped (no delta); lifecycle continues."
+      exit 0
+    fi
+    # Install the PREVIOUS published formula to create dirty state.
+    brew uninstall --force --ignore-dependencies "$NAME" 2>/dev/null || true
+    echo "Installing PREVIOUS published formula to create dirty state..."
+    # G6: this is a REAL prior release we fetched; a build failure here is a real failure,
+    # not a skip. G1: surface it (red).
+    brew install --build-from-source --formula "$PREV_RB"
+    OLD_PREFIX="$(brew --prefix "$NAME")"; echo "Old prefix: $OLD_PREFIX"
+    OLD_VERSION="$(brew list --versions "$NAME" | awk '{print $2}')"; echo "Old version: $OLD_VERSION"
+    # Now UPGRADE to our local working-copy build. G1: set -e + nonzero exit turns job red.
+    echo "Upgrading to local working-copy formula..."
+    brew reinstall --build-from-source --formula "$FILE"
+    NEW_PREFIX="$(brew --prefix "$NAME")"; echo "New prefix: $NEW_PREFIX"
+    NEW_VERSION="$(brew list --versions "$NAME" | awk '{print $2}')"; echo "New version: $NEW_VERSION"
+    [ -d "$NEW_PREFIX" ] || { echo "::error::keg missing after upgrade"; exit 1; }
+    brew list --formula "$NAME" >/dev/null || { echo "::error::$NAME not listed after upgrade"; exit 1; }
+    # G6: assert the installed keg now reflects the working-copy build. The keg prefix is
+    # version-stamped, so if the working copy declares a different version the prefix must
+    # change; if the version is unchanged the binaries must at least match a fresh build of
+    # the working copy. Confirm the working-copy formula is what is now installed.
+    if [ "$NEW_PREFIX" = "$OLD_PREFIX" ] && [ "$NEW_VERSION" = "$OLD_VERSION" ]; then
+      echo "::notice::Version string unchanged ($NEW_VERSION); reinstall replaced the keg with the working-copy build at the same version."
+    else
+      echo "Upgrade changed keg: $OLD_VERSION ($OLD_PREFIX) -> $NEW_VERSION ($NEW_PREFIX)"
+    fi
+    # Smoke the upgraded keg via its test block.
+    brew test --verbose "$NAME" || echo "::warning::brew test post-upgrade non-zero (may lack test do)"
+    echo "Upgrade over real previous release succeeded."
+
+- name: 'homebrew-formula | UNINSTALL and verify full removal'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    NAME="${{ steps.hbf.outputs.name }}"
+    # Capture prefix BEFORE removal so we can negatively assert it's gone after.
+    PREFIX="$(brew --prefix "$NAME" 2>/dev/null || true)"
+    CELLAR_BASE=""
+    [ -n "$PREFIX" ] && CELLAR_BASE="$(brew --cellar "$NAME" 2>/dev/null || true)"
+    # G1: uninstall failure turns job red.
+    brew uninstall --force --ignore-dependencies "$NAME"
+    # G7: negative assertions -- the job FAILS if anything remains.
+    if brew list --formula "$NAME" >/dev/null 2>&1; then
+      echo "::error::brew still lists $NAME after uninstall"; exit 1
+    fi
+    if [ -n "$CELLAR_BASE" ] && [ -d "$CELLAR_BASE" ]; then
+      echo "::error::Cellar dir still present after uninstall: $CELLAR_BASE"; exit 1
+    fi
+    # The symlinked bin should no longer resolve to this keg.
+    if [ -n "$PREFIX" ] && [ -d "$PREFIX" ]; then
+      echo "::error::keg prefix still present after uninstall: $PREFIX"; exit 1
+    fi
+    # brew --prefix for an absent formula returns the bare HOMEBREW_PREFIX or errors;
+    # confirm there is no installed keg via the explicit installed-list check.
+    if brew list --versions "$NAME" 2>/dev/null | grep -q .; then
+      echo "::error::brew reports a version for $NAME after uninstall"; exit 1
+    fi
+    echo "Uninstall verified: $NAME fully removed."
+
+- name: 'homebrew-formula | Lifecycle tripwire (mark success)'
+  if: matrix.type == 'homebrew-formula' && (runner.os == 'macOS' || runner.os == 'Linux')
+  shell: bash
+  run: |
+    set -euo pipefail
+    # REQUIRED tripwire: only reached after build/verify/launch/upgrade/uninstall-verify all
+    # passed on this OS. An all-skip leg never gets here, so downstream can catch a green
+    # job that tested nothing.
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+    echo "::notice::homebrew-formula lifecycle completed on $RUNNER_OS (LIFECYCLE_OK=1)."

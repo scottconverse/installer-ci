@@ -1,0 +1,170 @@
+[
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml \u2014 test job, tauri recipe, steps \"Install frontend dependencies\" and \"Build Tauri bundle\" (if: ${{ matrix.type == 'tauri' }}, shell: bash, no runner.os guard)",
+    "problem": "These two steps are gated only on matrix.type == 'tauri' with NO runner.os condition, so they execute on all three OSes \u2014 including windows-latest \u2014 under `shell: bash`. On Windows that resolves to Git Bash (C:\\Program Files\\Git\\bin\\bash). The body then runs `npx --no-install tauri build || npx tauri build` and `npm ci`/`npm install` inside Git Bash. This works only by accident of Git Bash being on PATH; it is a deliberate cross-shell choice that is invisible (no runner.os gate makes the Windows-vs-Unix shell selection implicit) and brittle: any future edit adding a Unix-only construct (e.g. a `$HOME`/`/tmp` path, `chmod`, `xvfb`) to these shared bash bodies will silently break the Windows leg, because Git Bash translates POSIX paths via MSYS path-mangling in ways pwsh/cmd would not. The build of an NSIS artifact under Git Bash also means the subsequent pwsh artifact-verify step must agree on path form.",
+    "fix": "Make the shell/OS contract explicit rather than implicit. Either (a) keep a single bash step but document and confirm Git Bash is the intended Windows shell, OR (b) split into Unix (`runner.os != 'Windows'`, shell: bash) and Windows (`runner.os == 'Windows'`, shell: pwsh) variants of the build/install steps so each leg uses its native shell, mirroring the pattern already used for the verify/install/upgrade/uninstall steps. At minimum add an explicit comment that `shell: bash` here is Git Bash on Windows by design, so reviewers don't add Unix-only constructs.",
+    "lens": "CROSS-OS SHELL CORRECTNESS"
+  },
+  {
+    "severity": "low",
+    "location": "reusableWorkflowYaml \u2014 assembly NOTE (b) in the header, applied across all 13 recipe groups: \"if: conditions wrapped as if: ${{ matrix.type == '<t>' && <runner.os guard> }}\"",
+    "problem": "The assembly claims a uniform transform that ANDs each recipe's `if:` with a runner.os guard, but the visible tauri recipe shows several steps (Setup Node, Setup Rust, Cache Cargo, Install frontend dependencies, Build Tauri bundle) carrying NO runner.os guard at all (just `matrix.type == 'tauri'`). This means the stated normalization is not actually uniform: shared cross-OS steps have no os gate while OS-specific ones do. For the 12 unseen recipe groups, the same transform description gives no assurance that each pwsh step is gated `runner.os == 'Windows'` and each bash-only step is gated to non-Windows. A recipe whose original `stepsYaml` had a pwsh step WITHOUT a `runner.os == 'Windows'` guard would, after this transform, attempt to run pwsh on Linux/macOS matrix legs (pwsh IS preinstalled on GitHub Linux/macOS runners, so it would not fail-to-find the shell, but would execute Windows-oriented logic like `$env:LOCALAPPDATA`/`$env:ProgramFiles` that is empty there, yielding false passes). This is a G4 gating risk that the header's own wording does not rule out.",
+    "fix": "For the 12 non-visible recipe groups, verify in the committed scottconverse/installer-ci file that EVERY `shell: pwsh` step is gated on `runner.os == 'Windows'` and every Unix-only `shell: bash` step (using sudo/apt/dpkg/hdiutil/PlistBuddy/xvfb) is gated to its specific OS. Add per-step runner.os guards where the recipe relied on the type-level OS fan-out (os_for) instead of an explicit per-step guard, since pwsh/bash both exist on all three runners and will silently run the wrong logic rather than erroring.",
+    "lens": "CROSS-OS SHELL CORRECTNESS"
+  },
+  {
+    "severity": "critical",
+    "location": "reusableWorkflowYaml \u2014 the entire `test.steps` block after the tauri recipe (the comment block beginning \"Each of the remaining 12 type groups appends here, verbatim...\")",
+    "problem": "The assembled artifact is INCOMPLETE as delivered. The JSON contains only the detect job + the test-job scaffolding (name/needs/if/runs-on/strategy/env) + the tauri recipe steps. The other 12 recipe step groups (electron, pyinstaller, python-pip-wheel, npm-bin, go-binary, cargo-binary, docker-image, shell-installer, deb-rpm, homebrew-formula, dotnet, java-jar) are NOT present \u2014 they are replaced by a prose comment claiming a 4409-line/227-step file 'was validated with a strict YAML parser' and 'is committed at scottconverse/installer-ci/...'. From a syntax-validity standpoint the delivered YAML cannot be confirmed valid because the bulk of test.steps does not exist in the artifact, and the validity claims (HTML-entity decoding to `&&`/`2>&1`, `if:` wrapping into `${{ matrix.type=='<t>' && ... }}`, exactly-one-shell-per-step, G1..G8 intact) are unverifiable assertions, not reviewable YAML.",
+    "fix": "Emit the full assembled YAML inline (all 13 recipe step groups under test.steps), not a prose placeholder. Then run an actual parser/linter (e.g. `actionlint` plus `yq`/`yamllint`) against the literal file and paste the result, rather than asserting it was validated. Until the 12 groups are present, treat the artifact as not syntactically complete.",
+    "lens": "YAML & GitHub-Actions syntax validity"
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml \u2014 jobs.test.strategy.matrix: `include: ${{ fromJSON(needs.detect.outputs.matrix) }}` combined with detect emitting `matrix=[]` in the noop branch",
+    "problem": "`matrix.include` is the ONLY matrix key (no base axes like a top-level `os:`/`type:` list). When detect produces noop, the output is the literal string `[]`, so `fromJSON('[]')` yields an empty array and `include: []` with no base axes resolves to a matrix with zero combinations. GitHub Actions can reject a matrix that defines no combinations ('Matrix must define at least one vector'/'does not contain any values'). The job-level `if: needs.detect.outputs.noop != 'true'` is what saves it (the job is skipped before producing runs), so correctness depends entirely on that guard never drifting. This is a fragile, easy-to-break coupling between the bash-emitted JSON shape and the matrix expansion.",
+    "fix": "Make the empty case explicit and self-evidently safe: keep the job-level `if` guard (it is load-bearing \u2014 do not remove it), and additionally have detect emit a non-empty sentinel-free guaranteed-valid structure, OR document/test that include:[] + job-if=false is the intended skip path. Add a CI assertion (or a unit test of the detect bash) confirming that on noop the test job is `skipped`, not `failed`, so a future change to the `if` can't silently turn the empty matrix into a hard error.",
+    "lens": "YAML & GitHub-Actions syntax validity"
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml \u2014 `env.ENABLE_SYSTEM_SCOPE` (workflow-level) and the duplicate in `jobs.test.env`, both `${{ inputs.enable_system_scope && 'true' || 'false' }}`",
+    "problem": "`inputs.*` only exists for `workflow_call` and `workflow_dispatch` triggers. On `push` and `pull_request` triggers there is no `inputs` context, so `inputs.enable_system_scope` is null/falsy and the expression resolves to the string 'false'. The expression itself is valid, but it produces a trigger-dependent value that contradicts the declared default (`default: true` on workflow_call). So a direct push to main runs with system scope DISABLED while a caller-invoked run defaults to ENABLED. This is a behavioral inconsistency that hides behind valid-looking expression syntax.",
+    "fix": "Decide on one default and make it trigger-independent, e.g. `${{ (inputs.enable_system_scope == null && true) || inputs.enable_system_scope }}` or normalize via a small bash step that writes the resolved value to $GITHUB_ENV. Document explicitly that push/PR runs intentionally disable system scope if that is the intent.",
+    "lens": "YAML & GitHub-Actions syntax validity"
+  },
+  {
+    "severity": "low",
+    "location": "reusableWorkflowYaml \u2014 tauri recipe: `Cache Cargo build` step `with.workspaces: ${{ env.TAURI_DIR }} -> target`, and the `working-directory: ${{ env.APP_DIR }}` on the frontend-install / build / verify steps",
+    "problem": "`env.TAURI_DIR` and `env.APP_DIR` are referenced but never defined anywhere in this workflow (no top-level `env:` entry, no job `env:`, no step `env:`). These resolve to empty strings. Not a YAML/expression syntax error, but the `with.workspaces` value becomes ` -> target` (leading space, no workspace path) and `working-directory:` becomes empty (falls back to the default working dir). The rollout plan even notes callers 'should set those repo-level Actions variables' \u2014 but repo-level Variables are `vars.*`, not `env.*`, so `${{ env.APP_DIR }}` will NOT pick up a repo Variable named APP_DIR; it stays empty regardless. This is a context-name mismatch (`env.` vs `vars.`).",
+    "fix": "Either add explicit `env: { APP_DIR: ., TAURI_DIR: src-tauri }` defaults at the workflow or test-job level, or change the references to `${{ vars.APP_DIR || '.' }}` / `${{ vars.TAURI_DIR || 'src-tauri' }}` so they actually read the repo-level Actions Variables the rollout plan tells maintainers to set.",
+    "lens": "YAML & GitHub-Actions syntax validity"
+  },
+  {
+    "severity": "critical",
+    "location": "reusableWorkflowYaml, detect job, `os_for()` does NOT emit deb-rpm/docker-image/homebrew/etc. on the matrix in a way the assembler claims to have verified \u2014 but the unreviewable bulk is the real defect: header NOTE says the file is '4409 lines / 227 steps' and the 12 non-tauri recipe groups 'paste in verbatim ... shown in full below', yet the YAML literally ends after the tauri group with a comment placeholder ('Each of the remaining 12 type groups appends here'). The shipped reusableWorkflowYaml contains ZERO steps for electron, pyinstaller, python-pip-wheel, npm-bin, go-binary, cargo-binary, docker-image, shell-installer, deb-rpm, homebrew-formula, dotnet, java-jar.",
+    "problem": "For any repo whose detection adds a non-tauri type, the matrix produces (type,os) legs that have NO matching steps (every step is gated `if: matrix.type == 'tauri'`). A job with all steps skipped EXITS 0 = GREEN. This is a global false-pass: e.g. patentforge (docker-image), the ~7 python-pip-wheel repos, civic-transparency-toolkit (pyinstaller) will all report a passing 'installer-test' check while building nothing, installing nothing, and asserting nothing. G1/G2/G6/G7 are entirely absent for 12 of 13 types.",
+    "fix": "Do not ship/validate against the placeholder. The 12 recipe step groups must actually be present in the file. Add a guard job that fails if a matrix leg ran zero steps for its type \u2014 e.g. each recipe's FIRST step writes a marker to GITHUB_ENV and a final always() step asserts the marker exists for matrix.type, failing the leg otherwise. Re-validate step count (assert 227 steps actually parse) in CI, not by prose assertion in a comment.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "critical",
+    "location": "reusableWorkflowYaml, test job: `strategy.matrix.include: ${{ fromJSON(needs.detect.outputs.matrix) }}`",
+    "problem": "Using `matrix.include` with ONLY an include array (no base matrix keys) is the documented GitHub Actions footgun: when `include` is the sole matrix content and the array is non-empty it does expand, but the `test` job's `if: needs.detect.outputs.noop != 'true'` is the only thing stopping an empty/garbage matrix. If detect emits a malformed matrix string (e.g. a forced type with a stray comma, or the bash JSON assembly producing `[{...},]`), `fromJSON` throws and the job is marked... not failed in a way tied to any installer assertion \u2014 and more importantly a forced type that is misspelled (force_types='taurii') sails through detect (no validation of type names against the known set) and produces a leg whose every `if` is false => all steps skip => GREEN. force_types is attacker/typo-controlled and unvalidated.",
+    "fix": "Validate each force_types token against the known 13-type set in detect and `exit 1` on an unknown type (never silently add it). Keep the per-leg 'did any step run for this type' assertion from the previous item so an all-skip leg fails instead of passing.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml, tauri 'Build Tauri bundle' step: `npx --no-install tauri build || npx tauri build`",
+    "problem": "Under `set -euo pipefail`, the `||` makes the build resilient to a missing local CLI \u2014 fine \u2014 but it also masks a real failure mode: if `npx --no-install tauri build` fails for a SUBSTANTIVE reason (compile error returns non-zero), the `|| npx tauri build` runs a SECOND build with a network-fetched CLI. A transient/partial first build plus a second invocation can leave stale-but-present artifacts that the later 'Verify artifact exists' step happily finds, so a genuinely broken build can still yield a green artifact-verification. The `||` cannot distinguish 'CLI not installed' from 'build failed'.",
+    "fix": "Probe CLI presence explicitly (e.g. `if npx --no-install tauri --version >/dev/null 2>&1; then RUN='npx --no-install tauri'; else RUN='npx tauri'; fi`) then run the build EXACTLY once with `$RUN build`, letting its non-zero exit fail the job (G1). Do not chain two builds with `||`.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml, 'Install + launch (Linux, AppImage user-scope)' G5 launch: `xvfb-run -a \"$HOME/.local/bin/app.AppImage\" ... & APP_PID=$!; sleep 8; kill -0 \"$APP_PID\"`",
+    "problem": "`$!` is the PID of the `xvfb-run` wrapper, not the AppImage process. `xvfb-run` is a shell script that starts Xvfb and execs/launches the target; depending on how the AppImage daemonizes or forks (common for GUI apps and for `--appimage-extract-and-run` which re-execs an extracted binary), `kill -0 $APP_PID` can return success because the wrapper/Xvfb is still up even if the actual app binary exited or never rendered. This lets a crash-on-launch app pass G5. The same `$!`-vs-real-child gap repeats in the Linux upgrade step.",
+    "fix": "Assert on the real app, not the wrapper: after sleep, grep the process table for the app's executable name (`pgrep -f <appbin>`), or launch via `xvfb-run -a bash -c 'exec app.AppImage ...'` and capture the inner PID, and verify a window actually exists (`xdotool search --name` / check Xvfb has a client). Fail if the app binary itself is not running.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml, 'Upgrade over previous release (Windows/Linux/macOS)' \u2014 the `gh release download ... ; if [ -z \"$PREV\" ]; then ...exit 0; fi` skip path",
+    "problem": "G6 (real upgrade) is structurally a no-op on every repo until a release exists. The rolloutPlan even states 'On first run there are no prior releases, so every G6 upgrade step takes its graceful-skip path \u2014 expected and correct.' That means the upgrade test asserts NOTHING on the runs people actually watch before merging (Phase 2/3/4 are all first-runs). A stubbed/never-exercised upgrade that always exits 0 is a false-pass for G6 by design \u2014 there is no signal that the skip is because-no-release vs because-download-silently-failed (`2>$null`/`2>/dev/null || true` swallows auth/network errors, which also yield empty $PREV => skip => green).",
+    "fix": "Distinguish 'no releases exist' (legitimately skip, but emit a visible SKIPPED status, ideally a neutral/annotated outcome rather than success) from 'download failed' (must FAIL). Check `gh release list` first; if releases exist but the asset download fails, exit non-zero. Consider seeding a synthetic prior artifact (e.g. build twice / fetch the immediately-prior CI artifact) so G6 actually exercises an over-install on first adoption instead of perpetually skipping.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml, tauri install/upgrade/uninstall steps gated on `&& env.ARTIFACT_APPIMAGE != ''` (Linux) and the macOS path that proceeds whether DMG or APP",
+    "problem": "On Linux, if the build produced only a .deb (no AppImage), ARTIFACT_APPIMAGE is empty and EVERY Linux install/launch/upgrade/uninstall step is skipped via the `env.ARTIFACT_APPIMAGE != ''` guard \u2014 the artifact-verify step passed because a .deb existed, but then nothing installs/launches/uninstalls and the leg is GREEN. The .deb is verified to exist (G2) but never installed or run (G1/G5/G7 silently skipped). A Linux Tauri repo that emits deb-only thus fully false-passes after the build.",
+    "fix": "If neither AppImage nor deb install path will run, fail the leg. Add a .deb install/launch/uninstall path (dpkg -i / apt install ./pkg.deb, run the installed binary under xvfb, then dpkg -r with a negative `command -v`/dpkg -s assertion) so a deb-only build is actually exercised, or assert ARTIFACT_APPIMEGE present when AppImage is the configured target.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml, macOS 'Check macOS signature' and Windows 'Check Windows Authenticode' steps (G8) and macOS launch step using `set -uo pipefail` (no -e) for parts",
+    "problem": "G8 warn-only steps unconditionally `exit 0` \u2014 that is the intended warn-not-block behavior, so not a false-pass for G8 itself. BUT the macOS launch step runs `BIN=$(/usr/libexec/PlistBuddy -c \"Print :CFBundleExecutable\" ...)` under `set -euo pipefail`; if PlistBuddy fails the step errors (good). The real gap: `pkill -f \"$BIN\"` / `pgrep -f \"$BIN\"` match on the executable basename across the whole process table. On the shared macOS runner a generic CFBundleExecutable name (e.g. 'app', 'main', 'Updater') can match an unrelated process, so `pgrep -f` succeeds even if the Tauri app never launched \u2014 a false G5 pass.",
+    "fix": "Match the full installed path, not the bare basename: `pgrep -f \"$APP_PATH/Contents/MacOS/$BIN\"` (anchor to the install dir), and verify the PID belongs to a process whose executable path is inside $APP_PATH. Same anchoring for the upgrade-launch assertion.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml, Windows install/upgrade/uninstall: `Where-Object { ... $_.DirectoryName -match 'CivicCast|civiccast|Tauri|tauri' }`",
+    "problem": "The exe/uninstaller discovery is hard-coded to the literal app name 'CivicCast' (one specific repo) plus a generic 'Tauri' fallback. For any other tauri repo whose install dir does not contain 'Tauri'/'tauri' in its path, `$exe` is null and the step does `Write-Error ... exit 1` \u2014 that is correctly a FAIL, not a false pass, for install. However the UNINSTALL step's second fallback also filters on the same name regex; if it finds nothing it errors (good), BUT the negative removal assertion `if (Test-Path $env:INSTALLED_EXE)` only verifies the single recorded exe path is gone \u2014 registry uninstall entries, Start Menu shortcuts, and %APPDATA% data are never asserted removed, so a partial uninstall that leaves everything except the one exe passes G7.",
+    "fix": "Derive the app/identifier from a repo variable rather than hard-coding 'CivicCast'. Strengthen G7 to assert removal of the install DIRECTORY and the Uninstall registry key (e.g. check HKCU\\...\\Uninstall no longer lists the product), not just one exe file path.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml, detect job `grep_files()` final pipeline: `... | while ...; do ... echo HIT; done | grep -q HIT` under `set -eu`",
+    "problem": "Detection correctness affects which lifecycles run. `grep -q HIT` exits as soon as it sees HIT, sending SIGPIPE to the upstream `while` loop; the loop's `grep`/`read` getting EPIPE plus the function's overall pipeline status can intermittently misreport. More importantly, mis-detection silently DROPS a type from the matrix (no error), so a repo that should be tested for, e.g., npm-bin can simply never get an npm-bin leg and the overall check is green having tested nothing for that capability \u2014 a false 'covered' signal.",
+    "fix": "Log the detected type set as a step summary and, for the high-signal producer repos, pin expectations (force_types or an assertion that the expected type is present) so a detection regression fails loudly instead of silently shrinking coverage. Avoid the SIGPIPE pattern: use `grep -ql` over the file list or set `pipefail`-aware logic that distinguishes 'no match' from 'pipeline error'.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "low",
+    "location": "callerWorkflowYaml / scheduledSweepPlan sweep.yml \u2014 `permissions: contents: read` on caller + `secrets: inherit`",
+    "problem": "Not an exit-code issue per se, but affects whether G6 can ever assert: the caller grants only contents:read and relies on `secrets: inherit` to flow GITHUB_TOKEN for `gh release download`. The default GITHUB_TOKEN can read releases, so this works for public repos; however if any target repo restricts default token permissions, `gh release download` fails, is swallowed by `2>/dev/null || true`, $PREV is empty, and G6 silently skips => green. The swallow makes a permissions misconfig indistinguishable from no-release.",
+    "fix": "As in the G6 item, do not swallow download stderr unconditionally; on a non-skip (releases exist) failure, exit non-zero so a token/permission problem turns the upgrade test red instead of green.",
+    "lens": "EXIT-CODE / FALSE-PASS INTEGRITY"
+  },
+  {
+    "severity": "critical",
+    "location": "reusableWorkflowYaml -> jobs.test.steps: macOS 'Upgrade over previous release (macOS)' step (and analogously the Windows/Linux upgrade steps). The step downloads a PRIOR release .dmg via `gh release download ... --pattern '*.dmg'`, mounts it, copies the .app, then `open \"$APP_PATH\"; sleep 8; pgrep -f \"$BIN\" || exit 1`.",
+    "problem": "This breaks the G8 'signing is warn-only, never hard-fail public CI' contract. Assets downloaded with `gh release download` carry the com.apple.quarantine xattr. An UNSIGNED/un-notarized prior release (the normal case for public CI without signing secrets) is blocked by Gatekeeper when launched via `open`, so it never starts, `pgrep` finds nothing, and the upgrade step exits 1 -> the job goes RED. So the very condition G8 promises to only warn about (no signing secrets) makes G6 a hard failure once a prior release exists. The local install/launch step escapes this only because locally-built apps lack the quarantine xattr; the downloaded upgrade asset does not.",
+    "fix": "Before launching downloaded release assets, strip quarantine: `xattr -dr com.apple.quarantine \"$APP_PATH\"` (and the mounted source). Alternatively make the launch assertion warn-only on macOS when no signing secrets are present (mirror the G8 warn pattern), or skip the launch portion of G6 for unsigned downloaded assets while still asserting the file-level upgrade (binary replaced, version bumped).",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml -> jobs.test.steps: Tauri Linux steps. 'Verify artifact exists (Linux)' accepts EITHER an AppImage OR a .deb and passes if either is found, but every downstream lifecycle step ('Install + launch (Linux, AppImage user-scope)', 'Upgrade over previous release (Linux AppImage)', 'Uninstall + verify removal (Linux AppImage)') is gated on `env.ARTIFACT_APPIMAGE != ''`.",
+    "problem": "A Tauri repo configured to produce only a .deb (no AppImage bundle) passes the artifact-verify gate (G2) but then SKIPS install, G5 launch, G6 upgrade, and G7 uninstall entirely on Linux \u2014 the job is green having never installed, launched, or removed anything. That is exactly the false-pass G1..G8 are supposed to prevent. The .deb is detected (ARTIFACT_DEB is exported) but never consumed anywhere.",
+    "fix": "Add a .deb install/launch/uninstall path (e.g. `sudo dpkg -i` or `apt install ./pkg.deb` then locate the installed binary and run it under xvfb-run for G5), OR if AppImage is required, make the verify step fail when ARTIFACT_APPIMAGE is empty rather than accepting deb-only. At minimum, fail loudly when an artifact was produced but no lifecycle path consumes it.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml -> jobs.test.steps: macOS 'Install + launch (macOS, .app user-scope)' and 'Upgrade over previous release (macOS)'. G5 assertion is `BIN=$(PlistBuddy -c 'Print :CFBundleExecutable' ...); pgrep -f \"$BIN\"`.",
+    "problem": "`pgrep -f` matches the substring anywhere in any process's full command line. If CFBundleExecutable is a short/common token (e.g. 'app', 'main', 'civiccast' appearing in a path), pgrep can match an UNRELATED running process, so a crashed app yields a false G5 pass. The companion `pkill -f \"$BIN\"` can also kill unrelated processes. This undermines 'GUI launch is real'.",
+    "fix": "Match the exact launched binary path instead of the bundle-executable name: capture the PID from `open` is not possible, so launch the inner binary directly (`\"$APP_PATH/Contents/MacOS/$BIN\" & APP_PID=$!`) and assert `kill -0 \"$APP_PID\"`, mirroring the Linux/Windows PID-based checks; or use `pgrep -f \"$APP_PATH/Contents/MacOS/$BIN\"` with the full absolute path to avoid loose substring matches.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "high",
+    "location": "reusableWorkflowYaml: only the `tauri` recipe is materialized in the artifact. The header NOTE asserts the other 12 type groups (electron, pyinstaller, python-pip-wheel, npm-bin, go-binary, cargo-binary, docker-image, shell-installer, deb-rpm, homebrew-formula, dotnet, java-jar) 'paste in verbatim' into jobs.test.steps but they are NOT present in the output; the file ends after the macOS Tauri uninstall step with a comment placeholder.",
+    "problem": "For this lens specifically (Tauri/PyInstaller/pip/Docker), three of the four named stacks \u2014 PyInstaller, python-pip-wheel, docker-image \u2014 have NO reviewable content in the assembled artifact. Their G5 launch reality and G8 signing handling cannot be verified, and the claim '227 steps validated' is unverifiable from what was delivered. As assembled, only tauri jobs would actually run; the detect engine can emit matrix entries for pyinstaller/pip/docker that have zero matching steps, so those matrix legs run, find no `if:`-matching steps, and pass green having done nothing (false pass for every non-tauri type).",
+    "fix": "Include the actual step bodies for all 12 remaining recipes (or deliver the real 4409-line file). Until then, treat coverage of PyInstaller/pip/Docker as unproven. Add a guard step per matrix leg that fails if a detected type executed zero lifecycle steps, so an empty/missing recipe cannot pass as green.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml -> env (top-level) and jobs.test.env: `ENABLE_SYSTEM_SCOPE: ${{ inputs.enable_system_scope && 'true' || 'false' }}`.",
+    "problem": "`inputs.*` is only populated for workflow_call and workflow_dispatch. On the push and pull_request triggers (declared in `on:`), `inputs.enable_system_scope` is undefined, so the expression evaluates to 'false'. The documented default is true, so on the most common triggers (push/PR) all optional system-scope install paths are silently disabled \u2014 inconsistent with the stated behavior and reducing real coverage exactly where most runs happen. (force_types has the same push/PR-undefined behavior but defaulting to auto-detect is benign.)",
+    "fix": "Make the default explicit and trigger-independent, e.g. `ENABLE_SYSTEM_SCOPE: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && 'true' || (inputs.enable_system_scope && 'true' || 'false') }}`, or document that system-scope only runs on call/dispatch. Pick one and align the docs/rolloutPlan.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml -> jobs.test.steps: 'Build Tauri bundle' step: `npx --no-install tauri build || npx tauri build`.",
+    "problem": "If the Tauri CLI is not a project dependency, `npx --no-install` fails and the fallback `npx tauri build` downloads whatever `tauri` package npx resolves at runtime (unpinned, network-dependent, potentially the wrong major version vs. the repo's tauri.conf.json schema). This can produce a misleading build failure or a bundle from a mismatched CLI, weakening the FIT claim that the build reflects the repo's real toolchain.",
+    "fix": "Require the project's pinned CLI (fail clearly if missing) or install a pinned version explicitly (e.g. `npm i -D @tauri-apps/cli@<pinned>` / cargo-tauri) before building, rather than silently fetching an unpinned CLI.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "medium",
+    "location": "reusableWorkflowYaml -> jobs.test.steps: Windows Tauri install/upgrade/uninstall steps filter installed exe via `Where-Object { $_.DirectoryName -match 'CivicCast|civiccast|Tauri|tauri' }`.",
+    "problem": "The exe/uninstaller discovery is hardcoded to the 'CivicCast' app name (plus generic 'Tauri'). For any other Tauri repo onboarded by this reusable workflow (the rolloutPlan names klodock and others), the installed app directory won't match 'CivicCast', and many NSIS/Tauri installs do not put literal 'Tauri' in the install path \u2014 so the post-install exe is not found and the step hard-fails ('Installed application exe not found'), or the uninstaller is missed. This is a generic reusable workflow with an app-specific hardcode, defeating reuse and producing false failures.",
+    "fix": "Derive the expected product/install dir from tauri.conf.json (productName/identifier) at runtime and match on that, or read the NSIS install location from the installer/registry, instead of hardcoding 'CivicCast'. Pass the product name via env from the caller.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  },
+  {
+    "severity": "low",
+    "location": "reusableWorkflowYaml -> jobs.test.steps: Tauri Linux 'Cache Cargo build' (`workspaces: ${{ env.TAURI_DIR }} -> target`), 'Install frontend dependencies' / 'Build Tauri bundle' (`working-directory: ${{ env.APP_DIR }}`), and the artifact-verify steps which use a fixed relative path `src-tauri/target/release/bundle`.",
+    "problem": "APP_DIR/TAURI_DIR are referenced but never defined in this workflow (the rolloutPlan says repos 'should set those repo-level Actions variables ... defaults are wired so a run still executes', but no default is wired here). If unset, `working-directory: ''` resolves to the workspace root and the rust-cache `workspaces:` becomes ' -> target'. More importantly the verify step's relative `src-tauri/target/...` assumes the bundle is under the same APP_DIR; if APP_DIR points at the frontend subdir but src-tauri is elsewhere, artifact discovery fails. Coupling is fragile and undocumented in the file itself.",
+    "fix": "Provide concrete defaults in env (e.g. `APP_DIR: ${{ vars.APP_DIR || '.' }}`, `TAURI_DIR: ${{ vars.TAURI_DIR || 'src-tauri' }}`) and make the bundle search relative to TAURI_DIR, so an unconfigured repo fails deterministically or runs with sane defaults rather than silently mis-resolving paths.",
+    "lens": "FIT + SIGNING: real-stack coverage (Tauri/PyInstaller/pip/Docker), graceful no-op degradation, real GUI launch (G5), and signing/notarization (G8) that warns without hard-failing public CI."
+  }
+]
