@@ -23,6 +23,11 @@
     echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
     if [ "$APP_DIR" = "." ]; then echo "TAURI_WS=src-tauri" >> "$GITHUB_ENV"; else echo "TAURI_WS=$APP_DIR/src-tauri" >> "$GITHUB_ENV"; fi
     echo "Resolved Tauri APP_DIR='$APP_DIR'"
+    # Derive the NSIS productName (Windows installs to %LOCALAPPDATA%\<productName>),
+    # so the Windows install/launch matches the REAL app dir, not the 'tauri' toolchain.
+    CONF="${CONF:-$(find . -name tauri.conf.json -not -path '*/node_modules/*' -not -path '*/target/*' 2>/dev/null | head -n1)}"
+    PROD="$(grep -oE '"productName"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONF" 2>/dev/null | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/')"
+    if [ -n "$PROD" ]; then echo "TAURI_PRODUCT_NAME=$PROD" >> "$GITHUB_ENV"; echo "Resolved productName='$PROD'"; fi
 
 - name: Setup Node (frontend build)
   if: ${{ matrix.type == 'tauri' }}
@@ -283,7 +288,7 @@
   env:
     # Product/install-dir match is derived from a documented var, not hardcoded.
     # Defaults to the literal type name so a generic Tauri repo still has a sane match.
-    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || 'tauri' }}
+    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || env.TAURI_PRODUCT_NAME }}
   run: |
     $ErrorActionPreference = 'Stop'
     # G1: silent install, wait, assert exit code 0.
@@ -293,7 +298,7 @@
     # by matching the derived product name (no hardcoded 'CivicCast').
     $match = [regex]::Escape($env:PRODUCT_MATCH)
     $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
-      Where-Object { $_.FullName -notmatch 'uninstall' -and $_.DirectoryName -match $match } |
+      Where-Object { $_.FullName -notmatch 'uninstall' -and $_.FullName -notlike '*\tauri\NSIS\*' -and $_.DirectoryName -match $match } |
       Select-Object -First 1
     if (-not $exe) {
       Write-Error "Installed application exe not found under $env:LOCALAPPDATA (product match: '$($env:PRODUCT_MATCH)'). Set vars.TAURI_PRODUCT_NAME to the NSIS productName."
@@ -319,7 +324,7 @@
   shell: pwsh
   env:
     GH_TOKEN: ${{ github.token }}
-    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || 'tauri' }}
+    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || env.TAURI_PRODUCT_NAME }}
   run: |
     $ErrorActionPreference = 'Stop'
     # Distinguish "no releases exist yet" (legit skip) from "download failed" (must FAIL).
@@ -346,7 +351,7 @@
     if ($p2.ExitCode -ne 0) { Write-Error "Upgrade install failed ($($p2.ExitCode))"; exit 1 }
     $match = [regex]::Escape($env:PRODUCT_MATCH)
     $exe = Get-ChildItem -Path $env:LOCALAPPDATA -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
-      Where-Object { $_.FullName -notmatch 'uninstall' -and $_.DirectoryName -match $match } |
+      Where-Object { $_.FullName -notmatch 'uninstall' -and $_.FullName -notlike '*\tauri\NSIS\*' -and $_.DirectoryName -match $match } |
       Select-Object -First 1
     if (-not $exe) { Write-Error "App missing after upgrade"; exit 1 }
     $app = Start-Process -FilePath $exe.FullName -PassThru
@@ -451,7 +456,7 @@
   if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
   shell: pwsh
   env:
-    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || 'tauri' }}
+    PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || env.TAURI_PRODUCT_NAME }}
   run: |
     $ErrorActionPreference = 'Stop'
     $match = [regex]::Escape($env:PRODUCT_MATCH)
