@@ -41,6 +41,18 @@
     # TAURI_WS (path from repo root) is set by the "Locate Tauri app directory" step.
     workspaces: ${{ env.TAURI_WS || 'src-tauri' }} -> target
 
+# Tauri v2 build deps for ubuntu-latest (24.04): glib/gtk/webkit dev headers are
+# required by glib-sys / webkit2gtk-sys at build time; libayatana-appindicator
+# replaces the old libappindicator on 24.04. (This step was dropped in an earlier
+# refactor, which caused glib-sys build failures on Linux.)
+- name: Install Linux Tauri system deps
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' }}
+  shell: bash
+  run: |
+    set -euo pipefail
+    sudo apt-get update
+    sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libglib2.0-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev patchelf build-essential pkg-config xvfb
+
 - name: Install frontend dependencies
   if: ${{ matrix.type == 'tauri' }}
   shell: bash
