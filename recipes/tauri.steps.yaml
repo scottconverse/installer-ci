@@ -2,6 +2,28 @@
   if: ${{ matrix.type == 'tauri' }}
   uses: actions/checkout@v4
 
+- name: Locate Tauri app directory
+  if: ${{ matrix.type == 'tauri' }}
+  shell: bash
+  # Auto-derive the app dir (parent of src-tauri) from tauri.conf.json so this recipe
+  # works whether the Tauri app is at the repo root or in a subdir (e.g. apps/installer).
+  # vars.APP_DIR overrides if set. shell: bash on Windows = Git Bash (find/dirname are POSIX).
+  env:
+    APP_DIR_OVERRIDE: ${{ vars.APP_DIR }}
+  run: |
+    set -euo pipefail
+    if [ -n "${APP_DIR_OVERRIDE:-}" ]; then
+      APP_DIR="$APP_DIR_OVERRIDE"
+    else
+      CONF=$(find . -name tauri.conf.json -not -path '*/node_modules/*' -not -path '*/target/*' 2>/dev/null | head -n1)
+      [ -n "$CONF" ] || { echo "::error::tauri detected but no tauri.conf.json found"; exit 1; }
+      APP_DIR=$(dirname "$(dirname "$CONF")")
+    fi
+    APP_DIR="${APP_DIR#./}"; [ -z "$APP_DIR" ] && APP_DIR="."
+    echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+    if [ "$APP_DIR" = "." ]; then echo "TAURI_WS=src-tauri" >> "$GITHUB_ENV"; else echo "TAURI_WS=$APP_DIR/src-tauri" >> "$GITHUB_ENV"; fi
+    echo "Resolved Tauri APP_DIR='$APP_DIR'"
+
 - name: Setup Node (frontend build)
   if: ${{ matrix.type == 'tauri' }}
   uses: actions/setup-node@v4
@@ -16,9 +38,8 @@
   if: ${{ matrix.type == 'tauri' }}
   uses: Swatinem/rust-cache@v2
   with:
-    # APP_DIR/TAURI_DIR are repo-level Actions Variables (vars.*), not env.*; a bare
-    # env.TAURI_DIR would silently resolve to '' and cache the wrong workspace.
-    workspaces: ${{ vars.TAURI_DIR || 'src-tauri' }} -> target
+    # TAURI_WS (path from repo root) is set by the "Locate Tauri app directory" step.
+    workspaces: ${{ env.TAURI_WS || 'src-tauri' }} -> target
 
 - name: Install frontend dependencies
   if: ${{ matrix.type == 'tauri' }}
@@ -26,7 +47,7 @@
   # NOTE: this step runs on all three OSes; on Windows `shell: bash` is Git Bash by
   # design. Keep the body POSIX/portable (no $HOME/chmod/xvfb here) so the Windows
   # leg does not break under MSYS path-mangling.
-  working-directory: ${{ vars.APP_DIR || '.' }}
+  working-directory: ${{ env.APP_DIR }}
   run: |
     set -euo pipefail
     if [ -f package-lock.json ]; then
@@ -40,7 +61,7 @@
   if: ${{ matrix.type == 'tauri' }}
   shell: bash
   # NOTE: runs on all three OSes; on Windows `shell: bash` is Git Bash by design.
-  working-directory: ${{ vars.APP_DIR || '.' }}
+  working-directory: ${{ env.APP_DIR }}
   run: |
     set -euo pipefail
     # Probe the project's pinned CLI exactly once, then build with ONE command path.
@@ -60,7 +81,7 @@
 - name: Verify artifact exists (Linux)
   if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' }}
   shell: bash
-  working-directory: ${{ vars.APP_DIR || '.' }}
+  working-directory: ${{ env.APP_DIR }}
   run: |
     set -euo pipefail
     BUNDLE="${TAURI_DIR}/target/release/bundle"
@@ -79,7 +100,7 @@
 - name: Verify artifact exists (macOS)
   if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
   shell: bash
-  working-directory: ${{ vars.APP_DIR || '.' }}
+  working-directory: ${{ env.APP_DIR }}
   run: |
     set -euo pipefail
     BUNDLE="${TAURI_DIR}/target/release/bundle"
@@ -98,7 +119,7 @@
 - name: Verify artifact exists (Windows)
   if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
   shell: pwsh
-  working-directory: ${{ vars.APP_DIR || '.' }}
+  working-directory: ${{ env.APP_DIR }}
   run: |
     $ErrorActionPreference = 'Stop'
     $tauriDir = if ($env:TAURI_DIR) { $env:TAURI_DIR } else { 'src-tauri' }

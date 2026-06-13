@@ -30,7 +30,7 @@
     if [ -z "$DOCKERFILE" ]; then
       if   [ -f Dockerfile ];          then DOCKERFILE=Dockerfile;          CONTEXT_DIR=.
       elif [ -f backend/Dockerfile ];  then DOCKERFILE=backend/Dockerfile;  CONTEXT_DIR=backend
-      else DOCKERFILE="$(find . -name Dockerfile -not -path '*/node_modules/*' | head -n1)"; CONTEXT_DIR="$(dirname "$DOCKERFILE")"; fi
+      else DOCKERFILE="$(find . \( -name Dockerfile -o -name 'Dockerfile.*' -o -name '*.Dockerfile' \) -not -path '*/node_modules/*' | head -n1)"; CONTEXT_DIR="$(dirname "$DOCKERFILE")"; fi
     fi
     test -n "$DOCKERFILE" -a -f "$DOCKERFILE" || { echo "::error::No Dockerfile found"; exit 1; }
     echo "DOCKERFILE=$DOCKERFILE"   >> "$GITHUB_ENV"

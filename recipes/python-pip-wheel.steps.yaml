@@ -398,8 +398,10 @@
       echo "::error::pip still reports $DIST_NAME installed after uninstall."
       exit 1
     fi
-    # Negative assertion 2: import must now fail.
-    if python -c "import importlib; importlib.import_module('$IMPORT_NAME')" 2>/dev/null; then
+    # Negative assertion 2: import must now fail. Run from an empty temp dir so the
+    # repo's local source tree (cwd is on sys.path for `python -c`) can't shadow the
+    # uninstalled package and produce a false "still installed".
+    if ( cd "$(mktemp -d)" && python -c "import importlib; importlib.import_module('$IMPORT_NAME')" ) 2>/dev/null; then
       echo "::error::Module $IMPORT_NAME still importable after uninstall."
       exit 1
     fi

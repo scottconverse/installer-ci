@@ -182,17 +182,20 @@ jobs:
             # pyinstaller: a *.spec AND a pyinstaller dependency reference
             { have_file '*.spec' && grep_files -i 'pyinstaller' pyproject.toml setup.py setup.cfg 'requirements*.txt' Pipfile; } && add pyinstaller
 
-            # python-pip-wheel: standard python packaging metadata
-            have_file 'pyproject.toml' 'setup.py' 'setup.cfg' && add python-pip-wheel
+            # python-pip-wheel: a ROOT-level buildable package (pyproject.toml/setup.py).
+            # setup.cfg-only or sub-dir configs are tooling, not an installable package.
+            { [ -f pyproject.toml ] || [ -f setup.py ]; } && add python-pip-wheel
 
             # npm-bin: package.json with a "bin" entry, unless it is a desktop-app manifest
             { has tauri || has electron; } || { grep_files '"bin"[[:space:]]*:' package.json && add npm-bin; }
 
-            # go-binary
-            have_file 'go.mod' && add go-binary
+            # go-binary: a go.mod AND a real `package main` (an installable binary,
+            # not an incidental/library go.mod).
+            { have_file 'go.mod' && grep_files '^package main' '*.go'; } && add go-binary
 
-            # cargo-binary: Cargo.toml outside any src-tauri/ tree
-            cargo_outside_tauri && add cargo-binary
+            # cargo-binary: Cargo.toml outside any src-tauri/ tree. Skip when tauri is
+            # present (the Rust there IS the Tauri app, not a standalone binary).
+            if ! has tauri && cargo_outside_tauri; then add cargo-binary; fi
 
             # docker-image
             have_file 'Dockerfile' 'Dockerfile.*' '*.Dockerfile' && add docker-image
@@ -258,6 +261,28 @@ jobs:
         if: ${{ matrix.type == 'tauri' }}
         uses: actions/checkout@v4
 
+      - name: Locate Tauri app directory
+        if: ${{ matrix.type == 'tauri' }}
+        shell: bash
+        # Auto-derive the app dir (parent of src-tauri) from tauri.conf.json so this recipe
+        # works whether the Tauri app is at the repo root or in a subdir (e.g. apps/installer).
+        # vars.APP_DIR overrides if set. shell: bash on Windows = Git Bash (find/dirname are POSIX).
+        env:
+          APP_DIR_OVERRIDE: ${{ vars.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_DIR_OVERRIDE:-}" ]; then
+            APP_DIR="$APP_DIR_OVERRIDE"
+          else
+            CONF=$(find . -name tauri.conf.json -not -path '*/node_modules/*' -not -path '*/target/*' 2>/dev/null | head -n1)
+            [ -n "$CONF" ] || { echo "::error::tauri detected but no tauri.conf.json found"; exit 1; }
+            APP_DIR=$(dirname "$(dirname "$CONF")")
+          fi
+          APP_DIR="${APP_DIR#./}"; [ -z "$APP_DIR" ] && APP_DIR="."
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          if [ "$APP_DIR" = "." ]; then echo "TAURI_WS=src-tauri" >> "$GITHUB_ENV"; else echo "TAURI_WS=$APP_DIR/src-tauri" >> "$GITHUB_ENV"; fi
+          echo "Resolved Tauri APP_DIR='$APP_DIR'"
+
       - name: Setup Node (frontend build)
         if: ${{ matrix.type == 'tauri' }}
         uses: actions/setup-node@v4
@@ -272,9 +297,8 @@ jobs:
         if: ${{ matrix.type == 'tauri' }}
         uses: Swatinem/rust-cache@v2
         with:
-          # APP_DIR/TAURI_DIR are repo-level Actions Variables (vars.*), not env.*; a bare
-          # env.TAURI_DIR would silently resolve to '' and cache the wrong workspace.
-          workspaces: ${{ vars.TAURI_DIR || 'src-tauri' }} -> target
+          # TAURI_WS (path from repo root) is set by the "Locate Tauri app directory" step.
+          workspaces: ${{ env.TAURI_WS || 'src-tauri' }} -> target
 
       - name: Install frontend dependencies
         if: ${{ matrix.type == 'tauri' }}
@@ -282,7 +306,7 @@ jobs:
         # NOTE: this step runs on all three OSes; on Windows `shell: bash` is Git Bash by
         # design. Keep the body POSIX/portable (no $HOME/chmod/xvfb here) so the Windows
         # leg does not break under MSYS path-mangling.
-        working-directory: ${{ vars.APP_DIR || '.' }}
+        working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
           if [ -f package-lock.json ]; then
@@ -296,7 +320,7 @@ jobs:
         if: ${{ matrix.type == 'tauri' }}
         shell: bash
         # NOTE: runs on all three OSes; on Windows `shell: bash` is Git Bash by design.
-        working-directory: ${{ vars.APP_DIR || '.' }}
+        working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
           # Probe the project's pinned CLI exactly once, then build with ONE command path.
@@ -316,7 +340,7 @@ jobs:
       - name: Verify artifact exists (Linux)
         if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' }}
         shell: bash
-        working-directory: ${{ vars.APP_DIR || '.' }}
+        working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
           BUNDLE="${TAURI_DIR}/target/release/bundle"
@@ -335,7 +359,7 @@ jobs:
       - name: Verify artifact exists (macOS)
         if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
         shell: bash
-        working-directory: ${{ vars.APP_DIR || '.' }}
+        working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
           BUNDLE="${TAURI_DIR}/target/release/bundle"
@@ -354,7 +378,7 @@ jobs:
       - name: Verify artifact exists (Windows)
         if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
         shell: pwsh
-        working-directory: ${{ vars.APP_DIR || '.' }}
+        working-directory: ${{ env.APP_DIR }}
         run: |
           $ErrorActionPreference = 'Stop'
           $tauriDir = if ($env:TAURI_DIR) { $env:TAURI_DIR } else { 'src-tauri' }
@@ -2060,8 +2084,10 @@ jobs:
             echo "::error::pip still reports $DIST_NAME installed after uninstall."
             exit 1
           fi
-          # Negative assertion 2: import must now fail.
-          if python -c "import importlib; importlib.import_module('$IMPORT_NAME')" 2>/dev/null; then
+          # Negative assertion 2: import must now fail. Run from an empty temp dir so the
+          # repo's local source tree (cwd is on sys.path for `python -c`) can't shadow the
+          # uninstalled package and produce a false "still installed".
+          if ( cd "$(mktemp -d)" && python -c "import importlib; importlib.import_module('$IMPORT_NAME')" ) 2>/dev/null; then
             echo "::error::Module $IMPORT_NAME still importable after uninstall."
             exit 1
           fi
@@ -3343,7 +3369,7 @@ jobs:
           if [ -z "$DOCKERFILE" ]; then
             if   [ -f Dockerfile ];          then DOCKERFILE=Dockerfile;          CONTEXT_DIR=.
             elif [ -f backend/Dockerfile ];  then DOCKERFILE=backend/Dockerfile;  CONTEXT_DIR=backend
-            else DOCKERFILE="$(find . -name Dockerfile -not -path '*/node_modules/*' | head -n1)"; CONTEXT_DIR="$(dirname "$DOCKERFILE")"; fi
+            else DOCKERFILE="$(find . \( -name Dockerfile -o -name 'Dockerfile.*' -o -name '*.Dockerfile' \) -not -path '*/node_modules/*' | head -n1)"; CONTEXT_DIR="$(dirname "$DOCKERFILE")"; fi
           fi
           test -n "$DOCKERFILE" -a -f "$DOCKERFILE" || { echo "::error::No Dockerfile found"; exit 1; }
           echo "DOCKERFILE=$DOCKERFILE"   >> "$GITHUB_ENV"
