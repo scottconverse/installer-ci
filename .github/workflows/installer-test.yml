@@ -189,16 +189,15 @@ jobs:
             # npm-bin: package.json with a "bin" entry, unless it is a desktop-app manifest
             { has tauri || has electron; } || { grep_files '"bin"[[:space:]]*:' package.json && add npm-bin; }
 
-            # go-binary: a go.mod AND a real `package main` (an installable binary,
-            # not an incidental/library go.mod).
-            { have_file 'go.mod' && grep_files '^package main' '*.go'; } && add go-binary
+            # go-binary: OPT-IN ONLY. A Go CLI is end-user-installable, but a go.mod is
+            # usually a service/sidecar; enable per-repo via force_types: go-binary.
 
             # cargo-binary: Cargo.toml outside any src-tauri/ tree. Skip when tauri is
             # present (the Rust there IS the Tauri app, not a standalone binary).
             if ! has tauri && cargo_outside_tauri; then add cargo-binary; fi
 
-            # docker-image
-            have_file 'Dockerfile' 'Dockerfile.*' '*.Dockerfile' && add docker-image
+            # docker-image: OPT-IN ONLY. A container image is deployment, not an
+            # end-user installer; enable per-repo via force_types: docker-image.
 
             # shell-installer
             have_file 'install.sh' 'install.ps1' && add shell-installer
