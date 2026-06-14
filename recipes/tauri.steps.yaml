@@ -31,7 +31,9 @@
     # Honor bundle.targets: an installer may target only some OSes (e.g. a Windows-only
     # "nsis" build). On a non-target OS the recipe validates that it COMPILES (the build
     # step), not that it produced an installable bundle.
-    TLINE="$(grep -oE '"targets"[[:space:]]*:[[:space:]]*(\[[^]]*\]|"[^"]*")' "$CONF" 2>/dev/null | head -n1)"
+    # Collapse newlines first (targets may be a multi-line array) and never fail the
+    # step: a no-match grep exits non-zero, which under set -e/pipefail would abort.
+    TLINE="$(tr -d '\n' < "$CONF" 2>/dev/null | grep -oE '"targets"[[:space:]]*:[[:space:]]*(\[[^]]*\]|"[^"]*")' | head -n1 || true)"
     BL=0; BM=0; BW=0
     if [ -z "$TLINE" ] || printf '%s' "$TLINE" | grep -q '"all"'; then BL=1; BM=1; BW=1; else
       printf '%s' "$TLINE" | grep -qiE '"(deb|rpm|appimage)"' && BL=1
