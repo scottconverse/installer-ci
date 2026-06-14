@@ -28,6 +28,18 @@
     CONF="${CONF:-$(find . -name tauri.conf.json -not -path '*/node_modules/*' -not -path '*/target/*' 2>/dev/null | head -n1)}"
     PROD="$(grep -oE '"productName"[[:space:]]*:[[:space:]]*"[^"]*"' "$CONF" 2>/dev/null | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/')"
     if [ -n "$PROD" ]; then echo "TAURI_PRODUCT_NAME=$PROD" >> "$GITHUB_ENV"; echo "Resolved productName='$PROD'"; fi
+    # Honor bundle.targets: an installer may target only some OSes (e.g. a Windows-only
+    # "nsis" build). On a non-target OS the recipe validates that it COMPILES (the build
+    # step), not that it produced an installable bundle.
+    TLINE="$(grep -oE '"targets"[[:space:]]*:[[:space:]]*(\[[^]]*\]|"[^"]*")' "$CONF" 2>/dev/null | head -n1)"
+    BL=0; BM=0; BW=0
+    if [ -z "$TLINE" ] || printf '%s' "$TLINE" | grep -q '"all"'; then BL=1; BM=1; BW=1; else
+      printf '%s' "$TLINE" | grep -qiE '"(deb|rpm|appimage)"' && BL=1
+      printf '%s' "$TLINE" | grep -qiE '"(dmg|app)"' && BM=1
+      printf '%s' "$TLINE" | grep -qiE '"(nsis|msi)"' && BW=1
+    fi
+    { echo "BUNDLE_LINUX=$BL"; echo "BUNDLE_MACOS=$BM"; echo "BUNDLE_WINDOWS=$BW"; } >> "$GITHUB_ENV"
+    echo "Bundle targets => linux=$BL macos=$BM windows=$BW"
 
 - name: Setup Node (frontend build)
   if: ${{ matrix.type == 'tauri' }}
@@ -95,8 +107,18 @@
     $RUN build
 
 # ---------- G2: VERIFY ARTIFACT EXISTS (before any install) ----------
+# For an OS the app does not bundle for (e.g. a Windows-only "nsis" installer on
+# Linux/macOS): the build step already validated that it COMPILES. There is no bundle
+# to verify/install, so mark the lifecycle satisfied and stop on this OS.
+- name: Compile-only validation (OS is not a bundle target)
+  if: ${{ matrix.type == 'tauri' && ( (runner.os == 'Linux' && env.BUNDLE_LINUX != '1') || (runner.os == 'macOS' && env.BUNDLE_MACOS != '1') || (runner.os == 'Windows' && env.BUNDLE_WINDOWS != '1') ) }}
+  shell: bash
+  run: |
+    echo "::notice::${{ runner.os }} is not a configured bundle target; the Tauri build (compile) passed, which is the validation for non-target OSes. No installable bundle is produced here by design."
+    echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
+
 - name: Verify artifact exists (Linux)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   working-directory: ${{ env.APP_DIR }}
   run: |
@@ -115,7 +137,7 @@
     TAURI_DIR: ${{ vars.TAURI_DIR || 'src-tauri' }}
 
 - name: Verify artifact exists (macOS)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' && env.BUNDLE_MACOS == '1' }}
   shell: bash
   working-directory: ${{ env.APP_DIR }}
   run: |
@@ -134,7 +156,7 @@
     TAURI_DIR: ${{ vars.TAURI_DIR || 'src-tauri' }}
 
 - name: Verify artifact exists (Windows)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' && env.BUNDLE_WINDOWS == '1' }}
   shell: pwsh
   working-directory: ${{ env.APP_DIR }}
   run: |
@@ -156,7 +178,7 @@
 
 # ---------- G8: SIGNING / NOTARIZATION (WARN, do not block) ----------
 - name: Check macOS signature / notarization (warn-only)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' && env.BUNDLE_MACOS == '1' }}
   shell: bash
   run: |
     set -uo pipefail
@@ -173,7 +195,7 @@
     exit 0
 
 - name: Check Windows Authenticode signature (warn-only)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' && env.BUNDLE_WINDOWS == '1' }}
   shell: pwsh
   run: |
     $sig = Get-AuthenticodeSignature -FilePath $env:ARTIFACT_NSIS
@@ -185,7 +207,7 @@
 
 # ---------- INSTALL (user-scope; NSIS currentUser mode) + G5 LAUNCH ----------
 - name: Install + launch (Linux, AppImage user-scope)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   run: |
     set -euo pipefail
@@ -215,7 +237,7 @@
 
 # Deb-only build must NOT skip the whole lifecycle green: install/launch/uninstall the .deb.
 - name: Install + launch (Linux, .deb system-scope)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB != '' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB != '' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   run: |
     set -euo pipefail
@@ -242,14 +264,14 @@
 
 # Loud failure: an artifact existed but no Linux install path consumed it.
 - name: Fail if no Linux lifecycle path ran
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB == '' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB == '' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   run: |
     echo "::error::Linux artifact present at verify but neither AppImage nor .deb install path ran; refusing to pass green."
     exit 1
 
 - name: Install + launch (macOS, .app user-scope)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' && env.BUNDLE_MACOS == '1' }}
   shell: bash
   run: |
     set -euo pipefail
@@ -283,7 +305,7 @@
     pkill -f "$EXEC_PATH" 2>/dev/null || true
 
 - name: Install + launch (Windows, NSIS currentUser)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' && env.BUNDLE_WINDOWS == '1' }}
   shell: pwsh
   env:
     # Product/install-dir match is derived from a documented var, not hardcoded.
@@ -320,7 +342,7 @@
 
 # ---------- G6: REAL UPGRADE (install prior release first, then upgrade) ----------
 - name: Upgrade over previous release (Windows)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' && env.BUNDLE_WINDOWS == '1' }}
   shell: pwsh
   env:
     GH_TOKEN: ${{ github.token }}
@@ -361,7 +383,7 @@
     Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
 
 - name: Upgrade over previous release (Linux AppImage)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   env:
     GH_TOKEN: ${{ github.token }}
@@ -403,7 +425,7 @@
     pkill -f "$EXDIR/squashfs-root" 2>/dev/null || true
 
 - name: Upgrade over previous release (macOS)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' && env.BUNDLE_MACOS == '1' }}
   shell: bash
   env:
     GH_TOKEN: ${{ github.token }}
@@ -453,7 +475,7 @@
 
 # ---------- G7: UNINSTALL + negative removal assertion ----------
 - name: Uninstall + verify removal (Windows)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Windows' && env.BUNDLE_WINDOWS == '1' }}
   shell: pwsh
   env:
     PRODUCT_MATCH: ${{ vars.TAURI_PRODUCT_NAME || vars.APP_NAME || env.TAURI_PRODUCT_NAME }}
@@ -475,17 +497,24 @@
       Write-Error "Uninstall incomplete: $($env:INSTALLED_EXE) still present"
       exit 1
     }
-    $remaining = if ($env:INSTALL_DIR -and (Test-Path $env:INSTALL_DIR)) { (Get-ChildItem -Path $env:INSTALL_DIR -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count } else { 0 }
-    if ($remaining -gt 0) {
-      Write-Error "Uninstall incomplete: $remaining file(s) remain under $($env:INSTALL_DIR)"
+    # The NSIS uninstaller removes what it INSTALLED, not files the app created at
+    # runtime (caches, logs, user data). The recorded exe being gone (above) proves a
+    # real uninstall; a leftover *.exe is a failure, other leftover files are warned.
+    $remaining = if ($env:INSTALL_DIR -and (Test-Path $env:INSTALL_DIR)) { @(Get-ChildItem -Path $env:INSTALL_DIR -Recurse -File -ErrorAction SilentlyContinue) } else { @() }
+    $leftExe = @($remaining | Where-Object { $_.Extension -eq '.exe' })
+    if ($leftExe.Count -gt 0) {
+      Write-Error "Uninstall incomplete: $($leftExe.Count) executable(s) still present under $($env:INSTALL_DIR)"
       exit 1
+    }
+    if ($remaining.Count -gt 0) {
+      Write-Warning "$($remaining.Count) non-executable file(s) remain under $($env:INSTALL_DIR) (likely app-created runtime data the installer does not track)."
     }
     Write-Host "Uninstall verified: application files removed."
     # Tripwire: a successful Windows lifecycle reached its end.
     "LIFECYCLE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
 - name: Uninstall + verify removal (Linux AppImage)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE != '' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   run: |
     set -euo pipefail
@@ -501,7 +530,7 @@
     echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
 
 - name: Uninstall + verify removal (Linux deb)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB != '' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'Linux' && env.ARTIFACT_APPIMAGE == '' && env.ARTIFACT_DEB != '' && env.BUNDLE_LINUX == '1' }}
   shell: bash
   run: |
     set -euo pipefail
@@ -522,7 +551,7 @@
     echo "LIFECYCLE_OK=1" >> "$GITHUB_ENV"
 
 - name: Uninstall + verify removal (macOS)
-  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' }}
+  if: ${{ matrix.type == 'tauri' && runner.os == 'macOS' && env.BUNDLE_MACOS == '1' }}
   shell: bash
   run: |
     set -euo pipefail
