@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>installer-ci | Test the install, not just the build</title>
+<meta name="description" content="A reusable GitHub Actions workflow that auto-detects how a repo installs software and tests it end to end: build, install, launch, upgrade over the previous release, uninstall. 13 installer types.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Cpath d='M9 17l5 5 9-11' fill='none' stroke='white' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#f7f8f7; --surface:#ffffff; --ink:#14201e; --muted:#53625f; --line:#dbe2df;
+  --accent:#0f766e; --accent-ink:#ffffff; --accent-soft:#e1f2ef;
+  --code-bg:#10201d; --code-ink:#d5ebe6; --warn:#92400e; --warn-bg:#fdf1dc;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0c1413; --surface:#121d1b; --ink:#e6f0ee; --muted:#9bb0ac; --line:#243532;
+  --accent:#2dd4bf; --accent-ink:#04201c; --accent-soft:#12302c;
+  --code-bg:#08100f; --code-ink:#cfe8e2; --warn:#f5c776; --warn-bg:#2b2111;
+}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 var(--sans);-webkit-text-size-adjust:100%}
+a{color:var(--accent)}
+a:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline-offset:2px;border-radius:4px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+.skip{position:absolute;left:-999px;top:0;background:var(--accent);color:var(--accent-ink);padding:8px 14px;z-index:10}
+.skip:focus{left:8px;top:8px}
+header.nav{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:56px;flex-wrap:wrap}
+.brand{font:700 17px var(--mono);color:var(--ink);text-decoration:none}
+.brand b{color:var(--accent)}
+.nav nav{display:flex;gap:18px;flex-wrap:wrap;font-size:14px}
+.nav nav a{color:var(--muted);text-decoration:none}
+.nav nav a:hover{color:var(--ink)}
+section{padding:64px 0;border-top:1px solid var(--line)}
+.hero{padding:72px 0 56px;border-top:0}
+.eyebrow{font:600 13px var(--mono);color:var(--accent);letter-spacing:.04em;text-transform:uppercase;margin:0 0 14px}
+h1{font-size:clamp(2rem,5.2vw,3.4rem);line-height:1.1;margin:0 0 20px;letter-spacing:-.02em;max-width:18ch}
+h2{font-size:clamp(1.5rem,3.2vw,2.1rem);line-height:1.2;margin:0 0 14px;letter-spacing:-.01em}
+h3{font-size:1.05rem;margin:0 0 6px}
+.lede{font-size:1.15rem;color:var(--muted);max-width:62ch;margin:0 0 28px}
+.sub{color:var(--muted);max-width:68ch;margin:0 0 28px}
+.cta{display:flex;gap:12px;flex-wrap:wrap}
+.btn{display:inline-block;padding:11px 20px;border-radius:8px;font-weight:600;text-decoration:none;border:1px solid var(--accent)}
+.btn.primary{background:var(--accent);color:var(--accent-ink)}
+.btn.ghost{color:var(--accent)}
+.btn:hover{filter:brightness(1.08)}
+.hero-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:40px;align-items:center}
+.hero-grid>*,.two>*{min-width:0}
+pre,code{font-family:var(--mono)}
+pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:16px 18px;overflow-x:auto;font-size:13.5px;line-height:1.55;margin:0;border:1px solid var(--line)}
+code.i{background:var(--accent-soft);padding:1px 6px;border-radius:5px;font-size:.88em;overflow-wrap:anywhere}
+.term{position:relative}
+.term .copy{position:absolute;top:8px;right:8px;font:12px var(--mono);background:#1c332f;color:#cfe8e2;border:1px solid #2c4a44;border-radius:6px;padding:4px 9px;cursor:pointer}
+.term .copy:hover{background:#25443e}
+.cap{font:12px var(--mono);color:var(--muted);margin:0 0 8px;overflow-wrap:anywhere}
+.pipe{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(5,1fr);gap:10px;counter-reset:s}
+.pipe li{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px;counter-increment:s}
+.pipe li::before{content:counter(s);font:700 12px var(--mono);color:var(--accent);display:block;margin-bottom:6px}
+.pipe strong{display:block;margin-bottom:4px}
+.pipe span{font-size:14px;color:var(--muted)}
+.tripwire{margin-top:12px;border:1px dashed var(--accent);background:var(--accent-soft);border-radius:10px;padding:12px 16px;font-size:15px}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px}
+.card p{margin:0;color:var(--muted);font-size:15px}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:620px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:600 12px var(--mono);text-transform:uppercase;letter-spacing:.04em;color:var(--muted);background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-family:var(--mono);font-weight:600;white-space:nowrap}
+.os{display:inline-block;font:12px var(--mono);border:1px solid var(--line);border-radius:5px;padding:0 6px;margin-right:4px;color:var(--muted)}
+.optin{font:600 11px var(--mono);background:var(--warn-bg);color:var(--warn);padding:1px 6px;border-radius:5px;margin-left:6px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:32px;align-items:start}
+.status{background:var(--warn-bg);border:1px solid color-mix(in srgb,var(--warn) 35%,transparent);border-radius:10px;padding:18px 20px}
+.status ul{margin:8px 0 0;padding-left:20px}
+.status li{margin:6px 0}
+ul.plain{padding-left:20px;margin:0}
+ul.plain li{margin:6px 0}
+.links{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;list-style:none;padding:0;margin:0}
+.links a{display:block;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--surface);text-decoration:none;color:var(--ink);overflow-wrap:anywhere}
+.links a:hover{border-color:var(--accent)}
+.links small{display:block;color:var(--muted)}
+footer{border-top:1px solid var(--line);padding:32px 0;color:var(--muted);font-size:14px}
+footer .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+@media (max-width:860px){
+  .hero-grid,.two{grid-template-columns:1fr}
+  .pipe{grid-template-columns:1fr 1fr}
+  .cards{grid-template-columns:1fr}
+  section{padding:48px 0}
+  .hero{padding:48px 0 40px}
+}
+@media (max-width:480px){.pipe{grid-template-columns:1fr}.nav nav{gap:12px}}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top">installer<b>-ci</b></a>
+    <nav aria-label="Primary">
+      <a href="#lifecycle">Lifecycle</a>
+      <a href="#types">13 types</a>
+      <a href="#guards">Guards</a>
+      <a href="#start">Use it</a>
+      <a href="#status">Status</a>
+      <a href="https://github.com/scottconverse/installer-ci">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<section class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <p class="eyebrow">Reusable GitHub Actions workflow</p>
+      <h1>Test the install, not just the build.</h1>
+      <p class="lede">installer-ci looks at your repo, works out which installer types it produces, and runs a real lifecycle for each one on GitHub-hosted runners: build, install, launch, upgrade over the previous release, uninstall.</p>
+      <div class="cta">
+        <a class="btn primary" href="#start">Add it to a repo</a>
+        <a class="btn ghost" href="https://github.com/scottconverse/installer-ci">View on GitHub</a>
+      </div>
+    </div>
+    <div>
+      <p class="cap">.github/workflows/installer-test.yml in your repo</p>
+      <div class="term"><pre><code>jobs:
+  installer-test:
+    uses: scottconverse/installer-ci/
+      .github/workflows/installer-test.yml@main
+    permissions: { contents: read, packages: read }
+    secrets: inherit</code></pre></div>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <h2>A green build can still ship an installer that does not install.</h2>
+    <p class="sub">The workflow is built around one rule: it must never false-pass. Each leg captures real exit codes, asserts the artifact exists, launches the real installed program rather than a wrapper process, and asserts that uninstall actually removed things. Repos with no installer, such as prompt or skill suites, no-op green: detection finds nothing and the test job is skipped.</p>
+    <div class="cards">
+      <div class="card"><h3>Auto-detects</h3><p>Reads manifests in the checkout and builds a matrix of installer type and runner OS. No per-repo configuration is required for the default types.</p></div>
+      <div class="card"><h3>Tests the whole lifecycle</h3><p>Build, install, launch, upgrade from the latest published release, uninstall, then a check that the lifecycle actually completed.</p></div>
+      <div class="card"><h3>One place to fix</h3><p>Callers pin <code class="i">@main</code>, so a fix to the workflow reaches every caller on its next run. Tag the repo and switch callers to a tag if you want immutability.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="lifecycle">
+  <div class="wrap">
+    <h2>The lifecycle each detected type runs</h2>
+    <p class="sub">Steps are defined per installer type in the recipes. Where a type has user and system install scopes, system scope is on by default (<code class="i">enable_system_scope</code>).</p>
+    <ol class="pipe">
+      <li><strong>Build</strong><span>Builds the artifact in the job and fails on a non-zero exit. It never assumes a prebuilt dist folder.</span></li>
+      <li><strong>Install</strong><span>Silent install with the exit code captured and asserted. The artifact is checked to exist first.</span></li>
+      <li><strong>Launch</strong><span>Starts the real installed program and asserts that process is alive. GUI apps launch headless on Linux.</span></li>
+      <li><strong>Upgrade</strong><span>Installs the previous published release, then upgrades over it. No prior release is treated differently from a failed download.</span></li>
+      <li><strong>Uninstall</strong><span>Uninstalls, then asserts the binary and install directory are gone.</span></li>
+    </ol>
+    <p class="tripwire"><strong>Tripwire.</strong> A leg that reaches the end of its lifecycle writes a marker. A matrix leg that skipped its whole lifecycle fails instead of reporting green.</p>
+  </div>
+</section>
+
+<section id="types">
+  <div class="wrap">
+    <h2>13 installer types, detected from your files</h2>
+    <p class="sub">Signals and runners below are taken from the detect job in the workflow. Detection skips <code class="i">node_modules</code>, <code class="i">vendor</code> and <code class="i">.git</code>.</p>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>Type</th><th>Detected when</th><th>Runners</th></tr></thead>
+        <tbody>
+          <tr><td>tauri</td><td>A <code class="i">src-tauri/tauri.conf.json</code> exists</td><td><span class="os">linux</span><span class="os">macos</span><span class="os">windows</span></td></tr>
+          <tr><td>electron</td><td>package.json depends on electron or electron-builder (not when tauri is detected)</td><td><span class="os">linux</span><span class="os">macos</span><span class="os">windows</span></td></tr>
+          <tr><td>pyinstaller</td><td>A <code class="i">*.spec</code> file plus a pyinstaller reference in pyproject, setup, requirements or Pipfile</td><td><span class="os">linux</span><span class="os">macos</span><span class="os">windows</span></td></tr>
+          <tr><td>python-pip-wheel</td><td>Root-level pyproject.toml or setup.py</td><td><span class="os">linux</span></td></tr>
+          <tr><td>npm-bin</td><td>package.json with a <code class="i">bin</code> entry, unless it is a tauri or electron app</td><td><span class="os">linux</span></td></tr>
+          <tr><td>cargo-binary</td><td>A Cargo.toml outside <code class="i">src-tauri/</code> (skipped when tauri is detected)</td><td><span class="os">linux</span><span class="os">macos</span><span class="os">windows</span></td></tr>
+          <tr><td>shell-installer</td><td>install.sh or install.ps1</td><td><span class="os">linux</span><span class="os">macos</span></td></tr>
+          <tr><td>deb-rpm</td><td>debian/control, debian/rules, or an rpm spec file</td><td><span class="os">linux</span></td></tr>
+          <tr><td>homebrew-formula</td><td>Formula/*.rb</td><td><span class="os">macos</span></td></tr>
+          <tr><td>dotnet</td><td>A .csproj or .sln file</td><td><span class="os">linux</span><span class="os">macos</span><span class="os">windows</span></td></tr>
+          <tr><td>java-jar</td><td>pom.xml, build.gradle or build.gradle.kts</td><td><span class="os">linux</span></td></tr>
+          <tr><td>go-binary<span class="optin">opt-in</span></td><td>Never auto-detected. Enable with <code class="i">force_types</code>; a go.mod is usually a service, not an end-user installer.</td><td><span class="os">linux</span><span class="os">macos</span><span class="os">windows</span></td></tr>
+          <tr><td>docker-image<span class="optin">opt-in</span></td><td>Never auto-detected. Enable with <code class="i">force_types</code>; an image is deployment, not an end-user installer.</td><td><span class="os">linux</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="guards">
+  <div class="wrap two">
+    <div>
+      <h2>Guards against false passes</h2>
+      <p class="sub">The workflow comments label its checks G1 to G8. These are the ones the source states explicitly.</p>
+      <ul class="plain">
+        <li><strong>Exit codes.</strong> Installer and build exit codes are captured and asserted, not swallowed.</li>
+        <li><strong>Artifact exists.</strong> The built artifact is resolved and asserted before any install is attempted.</li>
+        <li><strong>Real launch.</strong> The installed binary path is matched, so a wrapper or helper process cannot satisfy it.</li>
+        <li><strong>Real upgrade.</strong> A genuine prior release is downloaded and installed first. "No prior release" takes a graceful skip with a notice; a failed download does not.</li>
+        <li><strong>Negative uninstall.</strong> The install directory, binary or package must be gone afterwards.</li>
+        <li><strong>Signing is warn-only.</strong> Signing and notarization are checked, but public CI without signing secrets is not blocked.</li>
+      </ul>
+    </div>
+    <div>
+      <h2>Inputs and config</h2>
+      <p class="sub">Two workflow inputs, plus optional repository Actions variables.</p>
+      <ul class="plain">
+        <li><code class="i">force_types</code>: comma-separated list that overrides detection. It is validated against the 13 known types; an unknown value fails the run instead of creating an empty leg.</li>
+        <li><code class="i">enable_system_scope</code>: also run system-scope install paths. Default on.</li>
+        <li>Tauri reads <code class="i">vars.TAURI_PRODUCT_NAME</code>, <code class="i">vars.APP_DIR</code> (default <code class="i">.</code>) and <code class="i">vars.TAURI_DIR</code> (default <code class="i">src-tauri</code>).</li>
+        <li>Permissions needed: <code class="i">contents: read</code>, plus <code class="i">packages: read</code> for container image pulls.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap two">
+    <div>
+      <h2>Use it in a repo</h2>
+      <p class="sub">Add the caller as <code class="i">.github/workflows/installer-test.yml</code> and set the branches to your default branch. This is the form the repo README shows.</p>
+      <p class="sub">Or use the onboarding helper, which opens a pull request and is idempotent. It needs the <code class="i">gh</code> CLI signed in.</p>
+      <div class="term"><pre><code>./bootstrap.sh &lt;repo&gt;      # one repo
+./bootstrap.sh --all         # every repo</code></pre></div>
+      <p class="sub" style="margin-top:14px">ROLLOUT.md also plans a template repo and a weekly sweep so new repos get the caller too.</p>
+    </div>
+    <div>
+      <div class="term"><button class="copy" type="button" id="copybtn" hidden>Copy</button><pre id="full"><code>name: installer-test
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  workflow_dispatch:
+jobs:
+  installer-test:
+    uses: scottconverse/installer-ci/.github/workflows/installer-test.yml@main
+    permissions: { contents: read, packages: read }
+    secrets: inherit</code></pre></div>
+    </div>
+  </div>
+</section>
+
+<section id="status">
+  <div class="wrap">
+    <h2>Status, stated plainly</h2>
+    <div class="status">
+      <strong>Early. Read this before relying on it.</strong>
+      <ul>
+        <li>Only the <code class="i">tauri</code> recipe has been through the adversarial review pass. The other 12 are drafted and lint-clean (actionlint) but their guards are not yet independently verified. This is the workflow header's own statement.</li>
+        <li>VERIFY-FINDINGS.json records 24 review findings (4 critical, 8 high, 8 medium, 4 low). This page does not claim which have been resolved; read the file and the commit history.</li>
+        <li>The repository has no license file at the time of writing.</li>
+        <li>The scheduled sweep and template repo described in ROLLOUT.md are plans in that document. There is no sweep workflow in this repo.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="read">
+  <div class="wrap">
+    <h2>Read the source</h2>
+    <ul class="links">
+      <li><a href="https://github.com/scottconverse/installer-ci/blob/main/.github/workflows/installer-test.yml">The workflow<small>installer-test.yml, the source of truth</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/tree/main/recipes">Recipes<small>One steps file per installer type</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/blob/main/README.md">README<small>Usage and knobs</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/blob/main/ROLLOUT.md">ROLLOUT.md<small>Rollout, template and sweep plans</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/blob/main/VERIFY-FINDINGS.json">VERIFY-FINDINGS.json<small>Adversarial review notes</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/blob/main/caller-example.yml">caller-example.yml<small>Caller that also runs on develop</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/blob/main/bootstrap.sh">bootstrap.sh<small>Onboarding helper</small></a></li>
+      <li><a href="https://github.com/scottconverse/installer-ci/issues">Issues<small>Report a problem</small></a></li>
+    </ul>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>installer-ci by scottconverse</span>
+    <a href="https://github.com/scottconverse/installer-ci">github.com/scottconverse/installer-ci</a>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var b=document.getElementById('copybtn'),p=document.getElementById('full');
+  if(!b||!p||!navigator.clipboard){return;}
+  b.hidden=false;
+  b.addEventListener('click',function(){
+    navigator.clipboard.writeText(p.innerText).then(function(){
+      b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);
+    },function(){});
+  });
+})();
+</script>
+</body>
+</html>
