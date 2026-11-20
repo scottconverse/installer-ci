@@ -1,5 +1,7 @@
 # installer-ci
 
+Website (served from `docs/` via GitHub Pages once enabled): https://scottconverse.github.io/installer-ci/
+
 Central, reusable GitHub Actions workflow that **auto-detects how a repo installs software and tests that install end-to-end** — build → install → launch → upgrade-over-previous-release → uninstall — across Linux/macOS/Windows, for **13 installer types**:
 
 `tauri` · `electron` · `pyinstaller` · `python-pip-wheel` · `npm-bin` · `go-binary` · `cargo-binary` · `docker-image` · `shell-installer` · `deb-rpm` · `homebrew-formula` · `dotnet` · `java-jar`
